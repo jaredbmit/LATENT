@@ -136,22 +136,14 @@ The motion tracker training pipeline refers to the implementation in [OpenTrack]
   Here is a comparison of the original motion and the smoothed motion:
 
   <table>
-    <thead>
-      <tr>
-        <th>Original Motion</th>
-        <th>Smoothed Motion</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>
-          <video src="./storage/assets/demo/latent_original.mp4" controls muted loop playsinline width="100%"></video>
-        </td>
-        <td>
-          <video src="./storage/assets/demo/latent_smoothed.mp4" controls muted loop playsinline width="100%"></video>
-        </td>
-      </tr>
-    </tbody>
+    <tr>
+      <th>Original Motion</th>
+      <th>Smoothed Motion</th>
+    </tr>
+    <tr>
+      <td><img src="./storage/assets/demo/original.gif" width="100%"></td>
+      <td><img src="./storage/assets/demo/smoothed.gif" width="100%"></td>
+    </tr>
   </table>
 
   Then, follow the [training](#train-the-model) and [evaluation](#evaluate-the-model) sections to track the motions.

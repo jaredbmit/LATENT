@@ -79,7 +79,41 @@ source .venv/bin/activate; source .env;
 
 ## Motion tracking
 
-The motion tracker training pipeline refers to the implementation in [OpenTrack](https://github.com/GalaxyGeneralRobotics/OpenTrack).
+The motion tracker training pipeline is based on [OpenTrack](https://github.com/GalaxyGeneralRobotics/OpenTrack).
+
+### [Optional] Preprocess the motion data
+
+  If you want to train on your own motion data, you should first put the `.npz` files under `storage/data/mocap/<your_dataset_name>/UnitreeG1`. Then, you should run the following preprocess script to:
+
+  1. Align the frequency or the original motion data to the desired control frequency (50Hz by default).
+  2. Recalculate velocities (angular, linear, joint) and other state features based on the aligned frequency.
+  
+  **Note:** The preprocess script will overwrite the original motion files.
+
+  ```shell
+  # Use `num_batches` to split data into multiple batches for parallel processing on multiple GPUs. You should manually launch multiple processes on different GPUs for parallel processing.
+  python scripts/process_motion/preprocess_motion.py --task G1TrackingGeneral --num_batches XXX --smooth_start_end False
+  
+  # Or run on a single GPU without parallelism
+  python scripts/process_motion/preprocess_motion.py --task G1TrackingGeneral --num_batches 1 --smooth_start_end False
+  ```
+  
+  Argument `--smooth_start_end True` can generate a natural transition motion from the default pose before the original motion.
+  
+  An inverse-kinematics solver generates a smooth stepping motion from the default pose to the first motion frame. The solver uses QP optimization (OSQP) with foot position/orientation constraints and CoM balance constraints. One or two foot steps are automatically chosen based on the foot-placement gap between default pose and the pose of the first frame.
+
+  Here is a comparison of the original motion and the smoothed motion:
+
+  <table>
+    <tr>
+      <th>Original Motion</th>
+      <th>Smoothed Motion</th>
+    </tr>
+    <tr>
+      <td><img src="./storage/assets/demo/original.gif" width="100%"></td>
+      <td><img src="./storage/assets/demo/smoothed.gif" width="100%"></td>
+    </tr>
+  </table>
 
 
 ### Train the model
@@ -105,48 +139,6 @@ The motion tracker training pipeline refers to the implementation in [OpenTrack]
    ```shell
    python -m latent_mj.eval.tracking.mj_onnx_video --task G1TrackingTennis --exp_name <your_exp_name> [--use_viewer] [--use_renderer] [--play_ref_motion]
    ```
-
-### [Optional] Track your own motion data
-
-  **If you want to train on your own motion data:**
-  
-  You should first put the `.npz` files under `storage/data/mocap/<your_dataset_name>`.
-
-  **Preprocess the motion data:**
-
-  You should run the following preprocess script to:
-
-  1. Align the frequency or the original motion data to the desired control frequency.
-  2. Recalculate velocities (angular, linear, joint) and other state features based on the aligned frequency.
-  
-  **Note:** The preprocess script will overwrite the original motion files.
-
-  ```shell
-  # Use `num_batches` to split data into multiple batches for parallel processing on multiple GPUs. You should manually launch multiple processes on different GPUs for parallel processing.
-  python scripts/process_motion/preprocess_motion.py --task G1TrackingTennis --num_batches XXX --smooth_start_end False
-  
-  # Or run on a single GPU without parallelism
-  python scripts/process_motion/preprocess_motion.py --task G1TrackingTennis --num_batches 1 --smooth_start_end False
-  ```
-  
-  Argument `--smooth_start_end True` can generate a natural transition motion from the default pose before the original motion.
-  
-  An inverse-kinematics solver generates a smooth stepping motion from the default pose to the first motion frame. The solver uses QP optimization (OSQP) with foot position/orientation constraints and CoM balance constraints. One or two foot steps are automatically chosen based on the foot-placement gap between default pose and the pose of the first frame.
-
-  Here is a comparison of the original motion and the smoothed motion:
-
-  <table>
-    <tr>
-      <th>Original Motion</th>
-      <th>Smoothed Motion</th>
-    </tr>
-    <tr>
-      <td><img src="./storage/assets/demo/original.gif" width="100%"></td>
-      <td><img src="./storage/assets/demo/smoothed.gif" width="100%"></td>
-    </tr>
-  </table>
-
-  Then, follow the [training](#train-the-model) and [evaluation](#evaluate-the-model) sections to track the motions.
 
 ## Real-World Deployment
 

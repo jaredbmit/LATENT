@@ -113,7 +113,6 @@ def train(
     environment: envs.Env,
     num_timesteps: int,
     max_devices_per_host: Optional[int] = None,
-    # high-level control flow
     wrap_env: bool = True,
     # environment wrapper
     num_envs: int = 1,

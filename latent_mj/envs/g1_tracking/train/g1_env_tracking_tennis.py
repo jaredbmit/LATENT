@@ -27,7 +27,7 @@ from latent_mj.utils.dataset.traj_class import (
 )
 from latent_mj.utils.dataset.traj_handler import TrajectoryHandler, TrajCarry
 from latent_mj.utils.mujoco import mj_jntname2qposid, mj_jntid2qposid
-from latent_mj.utils.dataset.traj_process import ExtendTrajData
+from latent_mj.utils.dataset.traj_process import ExtendTrajData, SmoothStartEndTransition
 from latent_mj.utils import math as gmth
 
 ENABLE_PUSH = True
@@ -724,7 +724,7 @@ class G1TrackingTennisEnv(g1_base.G1Env):
         th_params = self._th_params if self._th_params is not None else {}
         return TrajectoryHandler(model=self._mj_model, warn=warn, traj=traj, control_dt=self.dt, **th_params)
 
-    def prepare_trajectory(self, dataset_dict: Dict[str, List[str]]) -> Trajectory:
+    def prepare_trajectory(self, dataset_dict: Dict[str, List[str]], smooth_start_end: bool = True) -> Trajectory:
         all_trajectories = []
         for dataset_name, traj_names in dataset_dict.items():
             print(f"Loading dataset: {dataset_name} with {len(traj_names)} trajectories.")
@@ -738,7 +738,7 @@ class G1TrackingTennisEnv(g1_base.G1Env):
                     traj = Trajectory.load(traj_path, backend=jp)
                     if not traj.data.is_complete:
                         print(f"Trajectory {t_name} is not complete. Extending...")
-                        traj = self.extend_motion(traj)
+                        traj = self.extend_motion(traj, smooth_start_end)
                         traj.save(traj_path)  # save trajectory before recalculating velocity
                     print(f"Loaded trajectory {t_name}")
 
@@ -767,7 +767,7 @@ class G1TrackingTennisEnv(g1_base.G1Env):
 
         return trajectory.data
 
-    def preprocess_trajectory(self, dataset_dict: Dict[str, List[str]], batch_idx: int, num_batches: int) -> Trajectory:
+    def preprocess_trajectory(self, dataset_dict: Dict[str, List[str]], batch_idx: int, num_batches: int, smooth_start_end: bool = True) -> Trajectory:
         all_trajectories = []
         num_trajectory = sum(len(traj_names) for traj_names in dataset_dict.values())
 
@@ -809,7 +809,7 @@ class G1TrackingTennisEnv(g1_base.G1Env):
 
                         if not traj.data.is_complete:
                             print(f"Trajectory {t_name} is not complete. Extending...")
-                            traj = self.extend_motion(traj)
+                            traj = self.extend_motion(traj, smooth_start_end=smooth_start_end)
                             traj.save(traj_path)  # save trajectory before recalculating velocity
                         print(f"Loaded trajectory {t_name}")
 
@@ -832,8 +832,12 @@ class G1TrackingTennisEnv(g1_base.G1Env):
 
         return None
 
-    def extend_motion(self, traj: Trajectory) -> Trajectory:
+    def extend_motion(self, traj: Trajectory, smooth_start_end: bool = True) -> Trajectory:
         assert traj.data.n_trajectories == 1
+
+        if smooth_start_end:
+            start_end_transition_smoother = SmoothStartEndTransition(model=self._mj_model, traj=traj)
+            traj = start_end_transition_smoother.run_interp(return_backend=jp)  # use default params
         
         traj_data, traj_info = interpolate_trajectories(traj.data, traj.info, 1.0 / self.dt)
         traj = Trajectory(info=traj_info, data=traj_data)

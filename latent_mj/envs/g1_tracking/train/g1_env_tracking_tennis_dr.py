@@ -28,7 +28,7 @@ from latent_mj.utils.dataset.traj_class import (
 )
 from latent_mj.utils.dataset.traj_handler import TrajectoryHandler, TrajCarry
 from latent_mj.utils.mujoco import mj_jntname2qposid, mj_jntid2qposid
-from latent_mj.utils.dataset.traj_process import ExtendTrajData
+from latent_mj.utils.dataset.traj_process import ExtendTrajData, SmoothStartEndTransition
 from latent_mj.utils import math as gmth
 from latent_mj.dr.domain_randomize_tracking import (
     domain_randomize,

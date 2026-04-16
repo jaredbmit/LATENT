@@ -12,6 +12,7 @@ from latent_mj.utils.dataset.traj_class import (
     TrajectoryData,
     SingleData)
 from latent_mj.utils.dataset.traj_handler import TrajCarry
+from latent_mj.utils.dataset.start_end_transition_handler import StartEndTransitionHandler
 from latent_mj.envs.g1_tracking import g1_tracking_constants_tennis as consts
 
 class ReplayCallback:
@@ -144,3 +145,60 @@ class ExtendTrajData(ReplayCallback):
             site_names.append(s_name)
         assert keys is None or len(keys) == 0, f"Could not find the following site names: {keys}"
         return site_names, list(ids)
+
+class SmoothStartEndTransition:
+
+    def __init__(self, model: mujoco.MjModel, traj: Trajectory):
+        self.mj_model = model
+        self.traj = traj
+        self._default_qpos = np.array(consts.DEFAULT_QPOS)
+        
+    def run_interp(
+            self,
+            default_pose_sec = 1.0,         # sec to maintain default pose at start
+            single_step_th = 0.1,           # threshold to step > 1 step
+            additional_transition_sec_start = 0.3,     # interp sec between last frame of IK and first frame of mocap
+            start_foot_id = 1,              # 0: left foot, 1: right foot
+            start_foot_h = 0.05,            # feet height during transition 1 (start)
+            start_com_off = 0.03,           # CoM offset during transition 1 (start)
+            start_step_sec = 0.3,           # single step sec during transition 1 (start)
+            return_backend: ModuleType = np,
+    ):
+        default_pose_len = int(default_pose_sec * self.traj.info.frequency)
+        additional_transition_len_start = int(additional_transition_sec_start * self.traj.info.frequency)
+        start_step_len = int(start_step_sec * self.traj.info.frequency)
+
+        transition_handler = StartEndTransitionHandler(
+            ori_traj=self.traj, model=self.mj_model, default_qpos=self._default_qpos, 
+            transition_len_start=additional_transition_len_start
+        )
+        # transition 1 (start)
+        if(transition_handler.compute_step_distance() > single_step_th):
+            num_steps = 2
+        else:
+            num_steps = 1
+
+        transition_handler.add_start_transition(
+            num_steps=num_steps,
+            start_foot_id=start_foot_id,
+            foot_h=start_foot_h,
+            com_off=start_com_off,
+            single_step_len=start_step_len,
+            double_step_len=3,
+            default_pose_len=default_pose_len,
+        )
+
+        qpos_traj = transition_handler.result
+        qpos_traj = return_backend.array(qpos_traj)
+
+        ret_traj = Trajectory(
+            info = self.traj.info,
+            data = TrajectoryData(
+                qpos = qpos_traj,
+                qvel = return_backend.zeros((qpos_traj.shape[0], self.traj.data.qvel.shape[-1])),
+                split_points = return_backend.array([0, qpos_traj.shape[0]]),
+                ),
+            transitions = self.traj.transitions if self.traj.transitions is not None else None,
+        )
+
+        return ret_traj

@@ -724,7 +724,7 @@ class G1TrackingTennisEnv(g1_base.G1Env):
         th_params = self._th_params if self._th_params is not None else {}
         return TrajectoryHandler(model=self._mj_model, warn=warn, traj=traj, control_dt=self.dt, **th_params)
 
-    def prepare_trajectory(self, dataset_dict: Dict[str, List[str]], smooth_start_end: bool = True) -> Trajectory:
+    def prepare_trajectory(self, dataset_dict: Dict[str, List[str]]) -> Trajectory:
         all_trajectories = []
         for dataset_name, traj_names in dataset_dict.items():
             print(f"Loading dataset: {dataset_name} with {len(traj_names)} trajectories.")
@@ -738,7 +738,7 @@ class G1TrackingTennisEnv(g1_base.G1Env):
                     traj = Trajectory.load(traj_path, backend=jp)
                     if not traj.data.is_complete:
                         print(f"Trajectory {t_name} is not complete. Extending...")
-                        traj = self.extend_motion(traj, smooth_start_end)
+                        traj = self.extend_motion(traj, smooth_start_end=False)
                         traj.save(traj_path)  # save trajectory before recalculating velocity
                     print(f"Loaded trajectory {t_name}")
 
@@ -835,17 +835,25 @@ class G1TrackingTennisEnv(g1_base.G1Env):
     def extend_motion(self, traj: Trajectory, smooth_start_end: bool = True) -> Trajectory:
         assert traj.data.n_trajectories == 1
 
-        if smooth_start_end:
-            start_end_transition_smoother = SmoothStartEndTransition(model=self._mj_model, traj=traj)
-            traj = start_end_transition_smoother.run_interp(return_backend=jp)  # use default params
-        
         traj_data, traj_info = interpolate_trajectories(traj.data, traj.info, 1.0 / self.dt)
         traj = Trajectory(info=traj_info, data=traj_data)
 
         self.th = TrajectoryHandler(
             model=self._mj_model, warn=True, traj=traj, control_dt=self.dt, random_start=False, fixed_start_conf=(0, 0)
         )
-        
+
+        traj = self.th.traj
+
+        # Move start/end smoothing to the penultimate preprocessing step.
+        if smooth_start_end:
+            start_end_transition_smoother = SmoothStartEndTransition(model=self._mj_model, traj=traj)
+            traj = start_end_transition_smoother.run_interp(return_backend=jp)  # use default params
+
+            # Rebuild trajectory handler because smoothing changes trajectory content/length.
+            self.th = TrajectoryHandler(
+                model=self._mj_model, warn=True, traj=traj, control_dt=self.dt, random_start=False, fixed_start_conf=(0, 0)
+            )
+
         traj_data, traj_info = self.th.traj.data, self.th.traj.info
 
         callback = ExtendTrajData(self, model=self._mj_model, n_samples=traj_data.n_samples)

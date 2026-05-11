@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tennis Mocap Dataset</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --accent: #38bdf8;
+    --accent2: #fbbf24;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --good: #4ade80;
+  }
+  html, body { margin: 0; padding: 0; background: #000; }
+  body { font-family: "Inter", "Helvetica Neue", Arial, sans-serif; color: var(--text); }
+  .slide {
+    width: 1920px;
+    height: 1080px;
+    background: linear-gradient(135deg, #0b1220 0%, #0f172a 60%, #111827 100%);
+    padding: 56px 72px;
+    box-sizing: border-box;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: 28px;
+  }
+  header { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 2px solid #334155; padding-bottom: 18px; }
+  h1 { font-size: 56px; margin: 0; letter-spacing: -0.5px; }
+  h1 .sub { color: var(--accent); font-weight: 500; }
+  .tag { color: var(--muted); font-size: 22px; font-family: ui-monospace, Menlo, monospace; }
+  .grid {
+    display: grid;
+    grid-template-columns: 1.05fr 1.15fr 1.4fr;
+    gap: 24px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid #334155;
+    border-radius: 18px;
+    padding: 22px 26px;
+    display: flex; flex-direction: column;
+  }
+  .card h2 {
+    margin: 0 0 14px 0;
+    font-size: 24px;
+    color: var(--accent);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+  .stat { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; font-size: 22px; line-height: 1.5; }
+  .stat .k { color: var(--muted); }
+  .stat .v { font-variant-numeric: tabular-nums; }
+  .stat .v.big { color: var(--accent2); font-weight: 600; }
+  ul.compact { margin: 0; padding-left: 22px; font-size: 20px; line-height: 1.55; }
+  ul.compact li { margin-bottom: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 18px; font-variant-numeric: tabular-nums; }
+  table th, table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #334155; }
+  table th { color: var(--muted); font-weight: 500; font-size: 16px; text-transform: uppercase; letter-spacing: 0.5px; }
+  table td.num { text-align: right; }
+  .schema-line { font-family: ui-monospace, Menlo, monospace; font-size: 18px; color: var(--text); background: #0b1220; padding: 10px 14px; border-radius: 10px; border: 1px solid #334155; margin-bottom: 12px; }
+  .joints-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; font-size: 16px; color: var(--text); font-family: ui-monospace, Menlo, monospace; }
+  .joints-grid .grp { color: var(--accent); margin-top: 6px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; grid-column: 1 / -1; }
+  footer { color: var(--muted); font-size: 16px; margin-top: 8px; display: flex; justify-content: space-between; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; background: #0b1220; border: 1px solid #334155; color: var(--good); font-size: 16px; margin-left: 8px; font-family: ui-monospace, Menlo, monospace; }
+  .arrays { font-family: ui-monospace, Menlo, monospace; font-size: 17px; line-height: 1.55; }
+  .arrays .k { color: var(--accent2); }
+  .arrays .s { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="slide">
+  <header>
+    <h1>Tennis Mocap Dataset <span class="sub">— Retargeted Unitree G1</span></h1>
+    <div class="tag">storage/data/mocap/Tennis &nbsp;•&nbsp; 50 Hz &nbsp;•&nbsp; 4 clips</div>
+  </header>
+
+  <div class="grid">
+
+    <!-- Column 1: Corpus stats + per-file table -->
+    <div class="card">
+      <h2>Corpus</h2>
+      <div class="stat">
+        <span class="k">Files</span><span class="v big">4</span>
+        <span class="k">Total frames</span><span class="v big">11,121</span>
+        <span class="k">Total duration</span><span class="v big">222.4 s &nbsp;(~3.7 min)</span>
+        <span class="k">Frequency</span><span class="v">50 Hz</span>
+        <span class="k">On-disk size</span><span class="v">28.2 MB</span>
+        <span class="k">Clips / file</span><span class="v">1 (no splits)</span>
+      </div>
+
+      <h2 style="margin-top:22px">Per-file</h2>
+      <table>
+        <thead><tr><th>file</th><th class="num">frames</th><th class="num">dur (s)</th><th class="num">size</th></tr></thead>
+        <tbody>
+          <tr><td>Random_001_Tennis</td><td class="num">1,874</td><td class="num">37.5</td><td class="num">4.8 MB</td></tr>
+          <tr><td>Random_002_Tennis</td><td class="num">2,725</td><td class="num">54.5</td><td class="num">6.9 MB</td></tr>
+          <tr><td>Random_003_Tennis</td><td class="num">2,773</td><td class="num">55.5</td><td class="num">7.0 MB</td></tr>
+          <tr><td>Random_004_Tennis</td><td class="num">3,749</td><td class="num">75.0</td><td class="num">9.5 MB</td></tr>
+        </tbody>
+      </table>
+
+      <h2 style="margin-top:22px">Kinematics</h2>
+      <div class="stat">
+        <span class="k">Root height z (m)</span><span class="v">0.51 / 0.68 / 0.85</span>
+        <span class="k">Base speed (m/s)</span><span class="v">μ 1.23 &nbsp; p95 2.08 &nbsp; max 2.80</span>
+        <span class="k">Joint |vel| (rad/s)</span><span class="v">μ 1.30 &nbsp; p95 4.40 &nbsp; max 71.2</span>
+        <span class="k">qvel populated?</span><span class="v" style="color:#fca5a5">no — derived via Δqpos</span>
+      </div>
+    </div>
+
+    <!-- Column 2: Schema + arrays -->
+    <div class="card">
+      <h2>Schema (Unitree G1)</h2>
+      <div class="schema-line">njnt=30 &nbsp; nbody=31 &nbsp; nsite=8 &nbsp; nq=36 &nbsp; nv=35</div>
+      <div class="schema-line">joints: 1 free (root, 7-DoF) &nbsp;+&nbsp; 29 hinge</div>
+
+      <h2 style="margin-top:14px">Arrays per file</h2>
+      <div class="arrays">
+        <div><span class="k">qpos</span> <span class="s">(T, 36)</span> &nbsp; root pose + hinge angles</div>
+        <div><span class="k">qvel</span> <span class="s">(T, 35)</span> &nbsp; <i style="color:#fca5a5">empty</i></div>
+        <div><span class="k">xpos</span> <span class="s">(T, 31, 3)</span> &nbsp; body world positions</div>
+        <div><span class="k">xquat</span> <span class="s">(T, 31, 4)</span> &nbsp; body world orientations</div>
+        <div><span class="k">cvel</span> <span class="s">(T, 31, 6)</span> &nbsp; body spatial velocities</div>
+        <div><span class="k">subtree_com</span> <span class="s">(T, 31, 3)</span></div>
+        <div><span class="k">site_xpos</span> <span class="s">(T, 8, 3)</span></div>
+        <div><span class="k">site_xmat</span> <span class="s">(T, 8, 9)</span></div>
+      </div>
+
+      <h2 style="margin-top:18px">Sites (8)</h2>
+      <ul class="compact">
+        <li>imu_in_pelvis, imu_in_torso</li>
+        <li>left_foot, left_foot_top, right_foot, right_foot_top</li>
+        <li>left_palm, right_palm</li>
+      </ul>
+
+      <h2 style="margin-top:18px">Bodies (31)</h2>
+      <ul class="compact">
+        <li>world → pelvis → waist → torso</li>
+        <li>L/R leg: hip(p/r/y) → knee → ankle(p/r)</li>
+        <li>L/R arm: shoulder(p/r/y) → elbow → wrist(r/p/y)</li>
+      </ul>
+    </div>
+
+    <!-- Column 3: Joint catalog with ranges -->
+    <div class="card">
+      <h2>Hinge joints &nbsp;<span class="pill">29 actuated DoF · range in rad</span></h2>
+      <div class="joints-grid">
+        <div class="grp">Left leg (6)</div>
+        <div>hip_pitch</div><div>[-1.71, +0.44]</div>
+        <div>hip_roll</div><div>[-0.52, +0.64]</div>
+        <div>hip_yaw</div><div>[-0.64, +0.56]</div>
+        <div>knee</div><div>[-0.01, +2.16]</div>
+        <div>ankle_pitch</div><div>[-0.88, +0.53]</div>
+        <div>ankle_roll</div><div>[-0.27, +0.27]</div>
+
+        <div class="grp">Right leg (6)</div>
+        <div>hip_pitch</div><div>[-1.76, +0.49]</div>
+        <div>hip_roll</div><div>[-1.13, +0.48]</div>
+        <div>hip_yaw</div><div>[-0.60, +0.79]</div>
+        <div>knee</div><div>[-0.09, +2.21]</div>
+        <div>ankle_pitch</div><div>[-0.88, +0.53]</div>
+        <div>ankle_roll</div><div>[-0.27, +0.27]</div>
+
+        <div class="grp">Waist (3)</div>
+        <div>yaw</div><div>[-1.01, +1.07]</div>
+        <div>roll</div><div>[-0.51, +0.52]</div>
+        <div>pitch</div><div>[-0.39, +0.52]</div>
+
+        <div class="grp">Left arm (7)</div>
+        <div>shoulder_pitch</div><div>[-2.06, +1.21]</div>
+        <div>shoulder_roll</div><div>[-0.29, +2.25]</div>
+        <div>shoulder_yaw</div><div>[-1.33, +1.88]</div>
+        <div>elbow</div><div>[-1.05, +1.70]</div>
+        <div>wrist_roll</div><div>[-1.40, +0.76]</div>
+        <div>wrist_pitch</div><div>[-0.74, +0.63]</div>
+        <div>wrist_yaw</div><div>[-0.62, +1.37]</div>
+
+        <div class="grp">Right arm (7)</div>
+        <div>shoulder_pitch</div><div>[-2.30, +1.61]</div>
+        <div>shoulder_roll</div><div>[-2.25, +0.34]</div>
+        <div>shoulder_yaw</div><div>[-2.39, +2.10]</div>
+        <div>elbow</div><div>[-0.87, +2.03]</div>
+        <div>wrist_roll</div><div>[-0.90, +1.68]</div>
+        <div>wrist_pitch</div><div>[-1.30, +0.62]</div>
+        <div>wrist_yaw</div><div>[-1.15, +0.79]</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

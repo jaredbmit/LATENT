@@ -57,7 +57,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["latent_mj"]
+packages = ["latent_mj", "motion_latent", "motion_latent.vae"]
 
 [tool.ruff]
 line-length = 120  # You can match black's default

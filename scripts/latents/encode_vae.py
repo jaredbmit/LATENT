@@ -4,20 +4,35 @@ For each clip, encodes every valid chunk [t, t+H] → z_t using the posterior
 mean (deterministic). Frames in the last H-1 positions of each clip have no
 valid chunk and are excluded.
 
+Each per-clip file additionally carries the original raw arrays verbatim
+(loaded from the file referenced in the feature `source` field), so the
+provenance of every latent is preserved.
+
+The combined diffusion_dataset.npz file contains, for every per-frame array
+found in the raw files, both a state slice (value at frame t) and a chunk
+slice (window [t, t+H]). All arrays are temporally aligned along axis 0:
+row k of every array corresponds to the same frame t in the same clip.
+
 Reads:
   storage/data/latents/<run>/model.pt
   storage/data/latents/<run>/config.json
-  storage/data/vae/features/*.npz
+  storage/data/vae/features/*.npz       (each file points to its raw source)
   storage/data/vae/norm_stats.npz
 
 Writes:
   storage/data/latents/<run>/encoded/<clip_stem>.npz
-      z      : (T', latent_dim)  per-frame latents, T' = T - H + 1
+      z         : (T', latent_dim)   per-frame latents
+      source    : str                path to the raw .npz
+      <key>     : raw arrays passed through verbatim
 
   storage/data/latents/<run>/diffusion_dataset.npz
-      states  : (N, D)           s_t — normalised state at frame t
-      latents : (N, latent_dim)  z_t — posterior mean
-      chunks  : (N, H, D)        full normalised chunk [t, t+H]
+      states          : (N, D)            s_t       — normalised state at frame t
+      latents         : (N, latent_dim)   z_t       — posterior mean
+      chunks          : (N, H, D)         normalised chunk [t, t+H]
+      raw_<key>_state : (N, ...)          raw value at frame t
+      raw_<key>_chunk : (N, H, ...)       raw window [t, t+H]
+      clip_id         : (N,) int32        index of the source clip per row
+      clip_names      : (n_clips,) str    name of each clip
 
 Usage:
   uv run python scripts/latents/encode_vae.py --run vae_hybrid
@@ -97,37 +112,75 @@ def main() -> None:
     print(f"Encoding {len(feat_files)} clip(s)...")
 
     all_states, all_latents, all_chunks = [], [], []
+    all_raw_states: dict[str, list[np.ndarray]] = {}
+    all_raw_chunks: dict[str, list[np.ndarray]] = {}
+    clip_id_per_row, clip_names = [], []
 
-    for path in feat_files:
-        raw   = np.load(path)["features"]          # (T, D)  unnormalised
-        feats = ((raw - mean) / std).astype(np.float32)   # (T, D)  normalised
+    for clip_idx, path in enumerate(feat_files):
+        feat_npz = np.load(path, allow_pickle=True)
+        raw_feat = feat_npz["features"]                              # (T, D) unnormalised
+        feats    = ((raw_feat - mean) / std).astype(np.float32)      # (T, D) normalised
+        T        = feats.shape[0]
 
-        z    = encode_clip(feats, model, H, device) # (T', latent_dim)
-        Tp   = z.shape[0]
+        source = str(feat_npz["source"])
+        raw    = np.load(source, allow_pickle=True)
+        raw_per_frame: dict[str, np.ndarray] = {}
+        raw_static:    dict[str, np.ndarray] = {}
+        for key in raw.files:
+            arr = raw[key]
+            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == T:
+                raw_per_frame[key] = arr
+            else:
+                raw_static[key] = arr
 
-        # Per-clip latent file
-        np.savez(enc_dir / path.name, z=z, source=str(path))
+        z  = encode_clip(feats, model, H, device)                    # (T', latent_dim)
+        Tp = z.shape[0]
 
-        # Accumulate for combined dataset
-        idx    = np.arange(Tp)[:, None] + np.arange(H)[None, :]  # (T', H)
-        chunks = feats[idx]                                        # (T', H, D)
-        all_states.append(feats[:Tp])                              # (T', D)
-        all_latents.append(z)                                      # (T', latent_dim)
-        all_chunks.append(chunks)                                  # (T', H, D)
+        # Per-clip latent file (z + all raw arrays verbatim).
+        # H is the chunk horizon: z[k] encodes raw[k : k+H] for every per-frame array.
+        np.savez(enc_dir / path.name,
+                 z=z, H=np.int32(H), latent_dim=np.int32(model.latent_dim),
+                 source=source, **raw_per_frame, **raw_static)
 
-        print(f"  {path.name:<45}  T={raw.shape[0]}  T'={Tp}  z={z.shape}")
+        # Sliding-window indexing — shared by feats and all raw per-frame arrays
+        idx    = np.arange(Tp)[:, None] + np.arange(H)[None, :]      # (T', H)
+        chunks = feats[idx]                                          # (T', H, D)
+        all_states.append(feats[:Tp])
+        all_latents.append(z)
+        all_chunks.append(chunks)
+        for key, arr in raw_per_frame.items():
+            all_raw_states.setdefault(key, []).append(arr[:Tp])
+            all_raw_chunks.setdefault(key, []).append(arr[idx])
+
+        clip_id_per_row.append(np.full(Tp, clip_idx, dtype=np.int32))
+        clip_names.append(path.stem)
+        print(f"  {path.name:<45}  T={T}  T'={Tp}  z={z.shape}")
 
     states  = np.concatenate(all_states,  axis=0)
     latents = np.concatenate(all_latents, axis=0)
     chunks  = np.concatenate(all_chunks,  axis=0)
+    clip_id = np.concatenate(clip_id_per_row, axis=0)
+
+    out: dict[str, np.ndarray] = {
+        "states":     states,
+        "latents":    latents,
+        "chunks":     chunks,
+        "H":          np.int32(H),
+        "latent_dim": np.int32(model.latent_dim),
+        "clip_id":    clip_id,
+        "clip_names": np.array(clip_names),
+    }
+    for key in all_raw_states:
+        out[f"raw_{key}_state"] = np.concatenate(all_raw_states[key], axis=0)
+        out[f"raw_{key}_chunk"] = np.concatenate(all_raw_chunks[key], axis=0)
 
     out_path = run_dir / "diffusion_dataset.npz"
-    np.savez(out_path, states=states, latents=latents, chunks=chunks)
+    np.savez_compressed(out_path, **out)
 
     print(f"\ndiffusion_dataset.npz")
-    print(f"  states  : {states.shape}")
-    print(f"  latents : {latents.shape}")
-    print(f"  chunks  : {chunks.shape}")
+    for k, v in out.items():
+        shp = v.shape if hasattr(v, "shape") else "-"
+        print(f"  {k:<28}: {shp}  {v.dtype if hasattr(v,'dtype') else ''}")
     print(f"  → {out_path}")
 
 

@@ -56,22 +56,23 @@ def train(args: argparse.Namespace) -> None:
         beta = args.beta * min(1.0, epoch / args.beta_warmup) if args.beta_warmup > 0 else args.beta
 
         model.train()
-        train_recon = train_kl = 0.0
+        train_recon = train_kl = train_iso = 0.0
         for chunk, s_t in train_dl:
             chunk, s_t = chunk.to(device), s_t.to(device)
-            loss, metrics = model.loss(chunk, s_t, beta=beta)
+            loss, metrics = model.loss(chunk, s_t, beta=beta, alpha=args.alpha)
             opt.zero_grad()
             loss.backward()
             opt.step()
             train_recon += metrics["recon"]
             train_kl    += metrics["kl"]
+            train_iso   += metrics["iso"]
         scheduler.step()
 
         if epoch % args.log_every == 0:
             n = len(train_dl)
             print(
                 f"epoch {epoch:4d}  lr={scheduler.get_last_lr()[0]:.2e}  beta={beta:.3f}  "
-                f"recon={train_recon/n:.4f}  kl={train_kl/n:.4f}"
+                f"recon={train_recon/n:.4f}  kl={train_kl/n:.4f}  iso={train_iso/n:.4f}"
             )
 
     # --- Save ---
@@ -95,6 +96,8 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int,   default=64)
     ap.add_argument("--lr",         type=float, default=1e-3)
     ap.add_argument("--beta",        type=float, default=1.0)
+    ap.add_argument("--alpha",       type=float, default=0.0,
+                    help="Weight on pairwise isometry loss. 0 disables.")
     ap.add_argument("--beta_warmup", type=int,   default=100,
                     help="Epochs to linearly ramp beta from 0 to --beta. 0 disables warmup.")
     ap.add_argument("--log_every",  type=int,   default=25)

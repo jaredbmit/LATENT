@@ -29,6 +29,23 @@ def reparameterize(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
     return mu + torch.randn_like(mu) * (0.5 * log_var).exp()
 
 
+def isometry_loss(z: torch.Tensor, chunk: torch.Tensor, latent_dim: int) -> torch.Tensor:
+    """Pairwise distance preservation between feature space and latent space.
+
+    Compares ||z_i - z_j|| against ||chunk_i - chunk_j|| / sqrt(H*D / latent_dim)
+    over all B*(B-1)/2 unordered pairs in the batch. Per-feature unit
+    normalization makes the expected squared distance 2*H*D regardless of
+    inter-frame correlation, so the analytic scale matches z ~ N(0, I) in
+    expectation.
+    """
+    B = chunk.shape[0]
+    D_feat = chunk.shape[1] * chunk.shape[2]
+    scale  = (D_feat / latent_dim) ** 0.5
+    d_lat  = torch.pdist(z)
+    d_feat = torch.pdist(chunk.reshape(B, -1))
+    return F.mse_loss(d_lat, d_feat / scale)
+
+
 def kl_two_gaussians(
     mu_q: torch.Tensor, lv_q: torch.Tensor,
     mu_p: torch.Tensor, lv_p: torch.Tensor,
@@ -156,9 +173,11 @@ class MotionVAE(nn.Module):
         chunk: torch.Tensor,
         s_t: torch.Tensor,
         beta: float = 1.0,
+        alpha: float = 0.0,
     ) -> tuple[torch.Tensor, dict]:
         recon, mu_q, lv_q, mu_p, lv_p = self(chunk, s_t)
         recon_loss = F.mse_loss(recon, chunk)
         kl_loss    = kl_two_gaussians(mu_q, lv_q, mu_p, lv_p)
-        total      = recon_loss + beta * kl_loss
-        return total, {"recon": recon_loss.item(), "kl": kl_loss.item()}
+        iso_loss   = isometry_loss(mu_q, chunk, self.latent_dim) if alpha > 0 else torch.zeros((), device=chunk.device)
+        total      = recon_loss + beta * kl_loss + alpha * iso_loss
+        return total, {"recon": recon_loss.item(), "kl": kl_loss.item(), "iso": iso_loss.item()}

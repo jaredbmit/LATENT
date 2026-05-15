@@ -7,22 +7,23 @@ Reconstructs absolute pose from the 80-D feature state:
   - root yaw:     integrated from root_angvel_z   (features[9])  per-chunk
   - root xy:      integrated from root_linvel_heading (features[4:7]) per-chunk
 
-Modes:
-  gt      — decode the ground-truth chunk
-  recon   — encode → decode (posterior mean → reconstruction)
-  sample  — sample z from the prior(s_t) → decode (generation)
-  compare — gt and recon side-by-side, recon offset by +1.5m in y
+Modes (all show GT on the left, prediction on the right):
+  gt      — ground truth only
+  recon   — teacher-forced: posterior mean at every step, conditioned on GT s_t
+  compare — alias for recon
+  rollout — autoregressive: prior mean z, free-running (no GT re-injection)
+  sample  — autoregressive: sampled z ~ p(z|s_t), free-running (stochastic)
 
 Usage:
-  uv run python scripts/inspect/render_vae_predictions.py --run vae_hybrid --mode recon
-  uv run python scripts/inspect/render_vae_predictions.py --run vae_hybrid --mode sample --idx 100
-  uv run python scripts/inspect/render_vae_predictions.py --run vae_hybrid --mode compare --loop
+  uv run python scripts/inspect/render_vae_predictions.py --run mvae_cond_base --mode recon
+  uv run python scripts/inspect/render_vae_predictions.py --run mvae_cond_base --mode rollout --horizon 300
+  uv run python scripts/inspect/render_vae_predictions.py --run mvae_cond_base --mode sample --horizon 200 --loop
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import bisect
 import time
 from pathlib import Path
 
@@ -30,129 +31,50 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 
+from motion_latent.paths import FEAT_DIR, G1_XML, LATENTS_ROOT, META_PATH, STATS_PATH
 from motion_latent.vae.dataset import MotionChunkDataset
+from motion_latent.vae.features import features_to_qpos
 from motion_latent.vae.model import MotionVAE
 
-G1_XML       = Path("storage/assets/unitree_g1/scene_mjx_flat_terrain.xml")
-CHUNKS_PATH  = Path("storage/data/vae/chunks_H64_s1.npz")
-STATS_PATH   = Path("storage/data/vae/norm_stats.npz")
-META_PATH    = Path("storage/data/vae/metadata.json")
-LATENTS_ROOT = Path("storage/data/latents")
 
+def rollout_sequence(model: MotionVAE, s0_normed: torch.Tensor,
+                     n_steps: int, device: torch.device,
+                     stochastic: bool = True) -> np.ndarray:
+    """Autoregressively generate n_steps one-step VAE predictions from the prior.
 
-# ---------------------------------------------------------------------------
-# Feature → qpos reconstruction
-# ---------------------------------------------------------------------------
+    stochastic=True  → z ~ p(z|s_t)  (sampled, noisy)
+    stochastic=False → z = mu_p(s_t) (prior mean, deterministic)
 
-def features_to_qpos(feats: np.ndarray, freq: float, xy0: np.ndarray | None = None,
-                     yaw0: float = 0.0) -> np.ndarray:
+    Returns (n_steps + 1, D) normalised features including s0 as the first row.
     """
-    Reconstruct (T, 36) MuJoCo qpos from (T, 80) features.
-
-    feats columns:
-      [0]      root_height
-      [1:4]    gravity in root frame
-      [4:7]    root linvel in heading frame
-      [7:10]   root angvel in root frame
-      [10:39]  joint angles
-    """
-    T  = feats.shape[0]
-    dt = 1.0 / freq
-
-    root_z      = feats[:, 0]
-    grav_root   = feats[:, 1:4]
-    linvel_hdg  = feats[:, 4:7]
-    angvel_root = feats[:, 7:10]
-    joint_ang   = feats[:, 10:39]
-
-    # --- yaw: integrate body-frame angvel_z (heading rate ≈ wz in upright stance) ---
-    yaw = np.empty(T)
-    yaw[0] = yaw0
-    for t in range(1, T):
-        yaw[t] = yaw[t - 1] + angvel_root[t - 1, 2] * dt
-
-    # --- pitch/roll from projected gravity: g_root = R_root^T @ [0,0,-1]  ---
-    # Closed-form: roll = atan2(-g_y, -g_z), pitch = atan2(g_x, sqrt(g_y^2+g_z^2))
-    gx, gy, gz = grav_root[:, 0], grav_root[:, 1], grav_root[:, 2]
-    roll  = np.arctan2(-gy, -gz)
-    pitch = np.arctan2( gx, np.sqrt(gy * gy + gz * gz))
-
-    # Compose full orientation: yaw (world) ∘ pitch ∘ roll  (intrinsic ZYX)
-    R_root = Rotation.from_euler("ZYX", np.stack([yaw, pitch, roll], axis=1))
-
-    # --- xy: rotate heading-frame linvel into world by yaw, integrate ---
-    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-    vx_w = cos_y * linvel_hdg[:, 0] - sin_y * linvel_hdg[:, 1]
-    vy_w = sin_y * linvel_hdg[:, 0] + cos_y * linvel_hdg[:, 1]
-    xy = np.zeros((T, 2))
-    if xy0 is not None:
-        xy[0] = xy0
-    for t in range(1, T):
-        xy[t, 0] = xy[t - 1, 0] + vx_w[t - 1] * dt
-        xy[t, 1] = xy[t - 1, 1] + vy_w[t - 1] * dt
-
-    # --- assemble qpos: [x, y, z, qw, qx, qy, qz, joints...] ---
-    quat_xyzw = R_root.as_quat()             # (T, 4) (x,y,z,w)
-    quat_mj   = np.concatenate([quat_xyzw[:, 3:4], quat_xyzw[:, :3]], axis=1)  # (w,x,y,z)
-
-    qpos = np.zeros((T, 7 + 29), dtype=np.float64)
-    qpos[:, 0:2]  = xy
-    qpos[:, 2]    = root_z
-    qpos[:, 3:7]  = quat_mj
-    qpos[:, 7:]   = joint_ang
-    return qpos
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_model(run_dir: Path, device: torch.device) -> tuple[MotionVAE, dict]:
-    cfg   = json.loads((run_dir / "config.json").read_text())
-    state = torch.load(run_dir / "model.pt", map_location=device)
-
-    # Older runs (e.g. vae_z16) don't record 'variant'. Infer it from the
-    # checkpoint: conditional decoder has in_dim = latent + D, others = latent.
-    # Prior weights exist only for conditional/hybrid.
-    variant = cfg.get("variant")
-    if variant is None:
-        dec_in   = state["decoder.net.0.weight"].shape[1]
-        has_prior = any(k.startswith("prior.") for k in state)
-        if dec_in == cfg["latent_dim"] + cfg["D"]:
-            variant = "conditional"
-        elif has_prior:
-            variant = "hybrid"
-        else:
-            variant = "unconditional"
-        print(f"  (inferred variant={variant} from checkpoint)")
-
-    model = MotionVAE(
-        D=cfg["D"], H=cfg["H"],
-        latent_dim=cfg["latent_dim"],
-        hidden=cfg["hidden"],
-        variant=variant,
-    ).to(device)
-    model.load_state_dict(state)
-    model.eval()
-    return model, cfg
-
-
-def predict(model: MotionVAE, chunk_normed: torch.Tensor, mode: str) -> torch.Tensor:
-    """Return predicted normalised chunk (H, D)."""
-    x   = chunk_normed.unsqueeze(0)            # (1, H, D)
-    s_t = x[:, 0]                              # (1, D)
+    all_states = [s0_normed.cpu().numpy()]
+    s_t = s0_normed.unsqueeze(0).to(device)   # (1, D)
     with torch.no_grad():
-        if mode == "recon":
-            z = model.encode(x)
-        elif mode == "sample":
-            z = model.sample(s_t)
-        else:
-            raise ValueError(mode)
-        s_dec = s_t if model.variant == "conditional" else None
-        recon = model.decoder(z, s_dec)        # (1, H, D)
-    return recon.squeeze(0)
+        for _ in range(n_steps):
+            z      = model.sample(s_t) if stochastic else model.prior_mean(s_t)
+            s_next = model.decode(z, s_t)            # (1, D)
+            all_states.append(s_next[0].cpu().numpy())
+            s_t = s_next
+    return np.stack(all_states)                      # (n_steps + 1, D)
+
+
+def teacher_forced_sequence(model: MotionVAE, gt_normed: np.ndarray,
+                             device: torch.device) -> np.ndarray:
+    """One-step posterior-mean predictions, conditioned on GT s_t at every step.
+
+    gt_normed : (n_frames, D) normalised GT frames
+    Returns   : (n_frames, D) with s_0 from GT, rest predicted.
+    """
+    gt_t = torch.from_numpy(gt_normed).to(device)
+    pred = [gt_normed[0]]
+    with torch.no_grad():
+        for t in range(gt_normed.shape[0] - 1):
+            s_t    = gt_t[t : t + 1]                  # (1, D)
+            s_next = gt_t[t + 1 : t + 2]              # (1, D)
+            z      = model.encode(s_next, s_t)
+            pred.append(model.decode(z, s_t)[0].cpu().numpy())
+    return np.stack(pred)
 
 
 # ---------------------------------------------------------------------------
@@ -256,11 +178,11 @@ def main() -> None:
     ap.add_argument("--run",   type=str, default="vae_hybrid",
                     help="run name under storage/data/latents/")
     ap.add_argument("--mode",  type=str, default="recon",
-                    choices=["gt", "recon", "sample", "compare"])
-    ap.add_argument("--idx",   type=int, default=-1,
-                    help="chunk index (-1 → random)")
-    ap.add_argument("--n_chunks", type=int, default=1,
-                    help="play this many consecutive chunks back-to-back")
+                    choices=["gt", "recon", "sample", "compare", "rollout"])
+    ap.add_argument("--idx",     type=int, default=-1,
+                    help="start frame index (-1 → random)")
+    ap.add_argument("--horizon", type=int, default=200,
+                    help="number of one-step VAE predictions to visualise (frames = horizon + 1)")
     ap.add_argument("--loop",  action="store_true",
                     help="loop the sequence forever (otherwise plays once "
                          "then idles on the last frame until window is closed)")
@@ -272,63 +194,61 @@ def main() -> None:
     rng    = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
-    # --- Load data & normalisation ---
+    # --- Load model and data ---
+    run_dir    = LATENTS_ROOT / args.run
+    model, cfg = MotionVAE.from_run(run_dir, device)
+    print(f"  variant={cfg['variant']}  residual={cfg.get('residual', False)}  "
+          f"latent_dim={cfg['latent_dim']}")
+
     meta  = json.loads(META_PATH.read_text())
     freq  = float(meta["freq"])
     stats = np.load(STATS_PATH)
     mean, std = stats["mean"], stats["std"]
 
-    dataset  = MotionChunkDataset(CHUNKS_PATH, STATS_PATH)
-    H        = dataset.chunks.shape[1]
-    n_chunks = max(1, args.n_chunks)
+    dataset = MotionChunkDataset(FEAT_DIR, STATS_PATH, H=1)
 
-    # Non-overlapping chunks: stride by H so each chunk starts where the prior
-    # one ended. The dataset itself has stride=1, so we step through it by H.
-    stride = H
-    last_valid_start = len(dataset) - 1 - (n_chunks - 1) * stride
-    if last_valid_start < 0:
-        raise ValueError(
-            f"Not enough chunks for {n_chunks} non-overlapping windows "
-            f"(need stride={stride}, have {len(dataset)})")
-    start_idx = args.idx if args.idx >= 0 else int(rng.integers(last_valid_start + 1))
-    indices   = [start_idx + i * stride for i in range(n_chunks)]
-    chunks_n  = torch.stack([dataset[i][0] for i in indices], dim=0)  # (N, H, D)
-    print(f"chunks (non-overlapping, stride={stride}): {indices}")
+    # --- Pick a contiguous window within a single clip ---
+    n_steps  = max(1, args.horizon)
+    n_frames = n_steps + 1
 
-    # --- Build per-chunk feature sequences (raw, denormalised) ---
-    gt_chunks_raw = [c.numpy() * std + mean for c in chunks_n]   # list of (H, D)
+    valid_starts = [
+        dataset.offsets[c] + t
+        for c in range(dataset.n_clips)
+        for t in range(max(0, dataset.clips[c].shape[0] - n_frames))
+    ]
+    if not valid_starts:
+        raise ValueError(f"No clip long enough for {n_frames} frames (horizon={args.horizon}).")
+    start_idx = args.idx if args.idx >= 0 else valid_starts[int(rng.integers(len(valid_starts)))]
 
-    seqs_per_chunk: list[list[np.ndarray]] = []   # one list per visual sequence
-    labels: list[str] = []
+    clip_idx  = bisect.bisect_right(dataset.offsets, start_idx) - 1
+    t0        = start_idx - dataset.offsets[clip_idx]
+    gt_normed = dataset.clips[clip_idx][t0 : t0 + n_frames].numpy()   # (n_frames, D)
+    print(f"start_idx={start_idx}  clip={clip_idx}  t0={t0}  n_steps={n_steps}  n_frames={n_frames}")
 
-    if args.mode in ("gt", "compare"):
-        seqs_per_chunk.append(gt_chunks_raw)
-        labels.append("gt")
+    gt_feats = gt_normed * std + mean
+    gt_qpos  = features_to_qpos(gt_feats, freq=freq, xy0=np.zeros(2), yaw0=0.0)
+    s0       = torch.from_numpy(gt_normed[0])
 
-    if args.mode in ("recon", "sample", "compare"):
-        run_dir = LATENTS_ROOT / args.run
-        model, cfg = load_model(run_dir, device)
-        pred_mode = "sample" if args.mode == "sample" else "recon"
-        preds_n = [predict(model, chunks_n[i].to(device), pred_mode).cpu().numpy()
-                   for i in range(chunks_n.shape[0])]
-        seqs_per_chunk.append([p * std + mean for p in preds_n])
-        labels.append(f"{args.run}:{pred_mode}")
+    def make_qpos(normed: np.ndarray) -> np.ndarray:
+        return features_to_qpos(normed * std + mean, freq=freq, xy0=np.zeros(2), yaw0=0.0)
 
-    # --- Reconstruct qpos per chunk with root reset, then concatenate ---
-    # Each chunk starts at xy=(0,0) and yaw=0 so the robot teleports back to
-    # origin between chunks instead of drifting via accumulated integration.
-    def reconstruct(chunks: list[np.ndarray]) -> np.ndarray:
-        return np.concatenate(
-            [features_to_qpos(c, freq=freq, xy0=np.zeros(2), yaw0=0.0) for c in chunks],
-            axis=0,
-        )
+    if args.mode == "gt":
+        play([gt_qpos], args.xml, freq=freq, loop=args.loop, labels=["gt"])
 
-    qpos_seqs = [reconstruct(cs) for cs in seqs_per_chunk]
+    elif args.mode in ("recon", "compare"):
+        pred_qpos = make_qpos(teacher_forced_sequence(model, gt_normed, device))
+        play_overlay([gt_qpos, pred_qpos], args.xml, freq=freq, loop=args.loop,
+                     labels=["gt", f"{args.run}:recon"])
 
-    if len(qpos_seqs) > 1:
-        play_overlay(qpos_seqs, args.xml, freq=freq, loop=args.loop, labels=labels)
-    else:
-        play(qpos_seqs, args.xml, freq=freq, loop=args.loop, labels=labels)
+    elif args.mode == "rollout":
+        pred_qpos = make_qpos(rollout_sequence(model, s0, n_steps, device, stochastic=False))
+        play_overlay([gt_qpos, pred_qpos], args.xml, freq=freq, loop=args.loop,
+                     labels=["gt", f"{args.run}:rollout_mean"])
+
+    elif args.mode == "sample":
+        pred_qpos = make_qpos(rollout_sequence(model, s0, n_steps, device, stochastic=True))
+        play_overlay([gt_qpos, pred_qpos], args.xml, freq=freq, loop=args.loop,
+                     labels=["gt", f"{args.run}:rollout_sample"])
 
 
 if __name__ == "__main__":

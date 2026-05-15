@@ -41,31 +41,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from motion_latent.paths import FEAT_DIR, LATENTS_ROOT, STATS_PATH
 from motion_latent.vae.model import MotionVAE
-
-FEAT_DIR    = Path("storage/data/vae/features")
-STATS_PATH  = Path("storage/data/vae/norm_stats.npz")
-LATENT_ROOT = Path("storage/data/latents")
-
-
-def load_model(run_dir: Path, device: torch.device) -> tuple[MotionVAE, int]:
-    config = json.loads((run_dir / "config.json").read_text())
-    model  = MotionVAE(
-        D          = config["D"],
-        H          = config["H"],
-        latent_dim = config["latent_dim"],
-        hidden     = config["hidden"],
-        variant    = config["variant"],
-    ).to(device)
-    model.load_state_dict(torch.load(run_dir / "model.pt", map_location=device))
-    model.eval()
-    return model, config["H"]
 
 
 @torch.no_grad()
@@ -78,14 +60,18 @@ def encode_clip(
 ) -> np.ndarray:
     """Encode all valid chunks in a clip. Returns (T', latent_dim)."""
     T  = feats.shape[0]
-    Tp = T - H + 1
-    # Build all chunks as a contiguous array
-    idx    = np.arange(Tp)[:, None] + np.arange(H)[None, :]  # (T', H)
-    chunks = torch.from_numpy(feats[idx]).float().to(device)  # (T', H, D)
+    Tp = T - H   # each window needs H+1 frames: s_t at t, future at t+1..t+H
+    # Build windows of H+1 frames; split into s_t (first) and chunk (rest)
+    idx     = np.arange(Tp)[:, None] + np.arange(H + 1)[None, :]   # (T', H+1)
+    windows = torch.from_numpy(feats[idx]).float().to(device)        # (T', H+1, D)
+    s_t_all = windows[:, 0]    # (T', D)
+    chunk_all = windows[:, 1:] # (T', H, D)
 
     latents = []
     for start in range(0, Tp, batch_size):
-        latents.append(model.encode(chunks[start : start + batch_size]))
+        # One-step transition encode: (s_t, s_{t+1}) → z. H is always 1.
+        latents.append(model.encode(chunk_all[start : start + batch_size, 0],
+                                    s_t_all[start : start + batch_size]))
     return torch.cat(latents).cpu().numpy()  # (T', latent_dim)
 
 
@@ -98,12 +84,13 @@ def main() -> None:
     args = ap.parse_args()
 
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = LATENT_ROOT / args.run
+    run_dir = LATENTS_ROOT / args.run
     enc_dir = run_dir / "encoded"
     enc_dir.mkdir(exist_ok=True)
 
-    model, H = load_model(run_dir, device)
-    print(f"Loaded {args.run}  (variant={model.variant}  latent_dim={model.latent_dim}  H={H})")
+    model, _ = MotionVAE.from_run(run_dir, device)
+    H = 1   # one-step transition model: each latent encodes (s_t, s_{t+1})
+    print(f"Loaded {args.run}  (variant={model.variant}  latent_dim={model.latent_dim})")
 
     stats     = np.load(args.stats)
     mean, std = stats["mean"], stats["std"]
@@ -137,14 +124,14 @@ def main() -> None:
         Tp = z.shape[0]
 
         # Per-clip latent file (z + all raw arrays verbatim).
-        # H is the chunk horizon: z[k] encodes raw[k : k+H] for every per-frame array.
+        # z[k] encodes s_t=feats[k], future=feats[k+1:k+H+1].
         np.savez(enc_dir / path.name,
                  z=z, H=np.int32(H), latent_dim=np.int32(model.latent_dim),
                  source=source, **raw_per_frame, **raw_static)
 
-        # Sliding-window indexing — shared by feats and all raw per-frame arrays
-        idx    = np.arange(Tp)[:, None] + np.arange(H)[None, :]      # (T', H)
-        chunks = feats[idx]                                          # (T', H, D)
+        # Sliding-window indexing: future H frames starting at t+1.
+        idx    = np.arange(Tp)[:, None] + 1 + np.arange(H)[None, :]  # (T', H)
+        chunks = feats[idx]                                            # (T', H, D)
         all_states.append(feats[:Tp])
         all_latents.append(z)
         all_chunks.append(chunks)

@@ -77,7 +77,7 @@ def encode_clip(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run",   type=str, default="vae_hybrid",
+    ap.add_argument("--run",   type=str, default="mvae_base",
                     help="Run name under storage/data/latents/")
     ap.add_argument("--feats", type=Path, default=FEAT_DIR)
     ap.add_argument("--stats", type=Path, default=STATS_PATH)

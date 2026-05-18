@@ -99,7 +99,7 @@ def train(args: argparse.Namespace) -> None:
     # --- Save ---
     torch.save(model.state_dict(), out_dir / "model.pt")
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update({"L": L, "D": D})
+    config.update({"L": L, "D": D, "model_type": "one_step_vae"})
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     print(f"saved → {out_dir}")
 
@@ -108,7 +108,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--features",   type=Path,  default=FEAT_DIR)
     ap.add_argument("--stats",      type=Path,  default=STATS_PATH)
-    ap.add_argument("--run_name",   type=str,   default="mvae_z16")
+    ap.add_argument("--run_name",   type=str,   default="mvae_base")
     ap.add_argument("--L",          type=int,   default=8,
                     help="Rollout / supervision horizon in frames. The VAE is "
                          "always a one-step transition model.")

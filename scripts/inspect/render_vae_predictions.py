@@ -24,15 +24,13 @@ from __future__ import annotations
 
 import argparse
 import bisect
-import time
 from pathlib import Path
 
-import mujoco
-import mujoco.viewer
 import numpy as np
 import torch
 
 from motion_latent.paths import FEAT_DIR, G1_XML, LATENTS_ROOT, META_PATH, STATS_PATH
+from motion_latent.render import play_overlay
 from motion_latent.vae.dataset import MotionChunkDataset
 from motion_latent.vae.features import features_to_qpos
 from motion_latent.vae.model import MotionVAE
@@ -75,97 +73,6 @@ def teacher_forced_sequence(model: MotionVAE, gt_normed: np.ndarray,
             z      = model.encode(s_next, s_t)
             pred.append(model.decode(z, s_t)[0].cpu().numpy())
     return np.stack(pred)
-
-
-# ---------------------------------------------------------------------------
-# Playback
-# ---------------------------------------------------------------------------
-
-def play(qpos_seqs: list[np.ndarray], xml_path: Path, freq: float, loop: bool,
-         labels: list[str]) -> None:
-    model = mujoco.MjModel.from_xml_path(str(xml_path))
-    data  = mujoco.MjData(model)
-    dt    = 1.0 / freq
-    T     = qpos_seqs[0].shape[0]
-    n_q   = model.nq
-
-    # Offset extra sequences in y so they don't overlap.
-    offsets = [np.array([0.0, 1.5 * i]) for i in range(len(qpos_seqs))]
-
-    print(f"Playing {T} frames @ {freq:.0f} Hz  ({T / freq:.2f} s)"
-          + ("  [loop]" if loop else ""))
-    print(f"  sequences: {labels}")
-
-    with mujoco.viewer.launch_passive(model, data) as viewer:
-        played_once = False
-        while viewer.is_running():
-            if played_once and not loop:
-                # Idle on last frame so the window stays open until user closes.
-                time.sleep(0.05)
-                viewer.sync()
-                continue
-            for t in range(T):
-                if not viewer.is_running():
-                    break
-                q = qpos_seqs[0][t].copy()
-                q[:2] += offsets[0]
-                data.qpos[:n_q] = q
-                mujoco.mj_forward(model, data)
-                viewer.sync()
-                time.sleep(dt)
-            played_once = True
-
-
-def play_overlay(qpos_seqs: list[np.ndarray], xml_path: Path, freq: float,
-                 loop: bool, labels: list[str]) -> None:
-    """Side-by-side via MjSpec.attach: one G1 per sequence, y-offset 1.5m."""
-    spec = mujoco.MjSpec.from_file(str(xml_path))
-    # Build a scene that attaches N copies of the robot subtree under offset frames.
-    # Approach: load N separate specs and attach them under the world body.
-    base_spec = spec
-    # Detach default robot worldbody children? Simpler path: load one combined xml
-    # by attaching additional copies of the robot xml only.
-    robot_xml = Path(str(xml_path).replace("scene_mjx_flat_terrain.xml", "g1_mjx.xml"))
-    for i in range(1, len(qpos_seqs)):
-        extra = mujoco.MjSpec.from_file(str(robot_xml))
-        frame = base_spec.worldbody.add_frame(pos=[0.0, 1.5 * i, 0.0])
-        base_spec.attach(extra, prefix=f"r{i}_", frame=frame)
-
-    model = base_spec.compile()
-    data  = mujoco.MjData(model)
-    dt    = 1.0 / freq
-    T     = qpos_seqs[0].shape[0]
-
-    print(f"Overlay: {len(qpos_seqs)} robots @ y=0,1.5,...   labels={labels}")
-
-    # Pre-locate per-robot qpos slices via their freejoint addresses.
-    free_addrs = []
-    for jid in range(model.njnt):
-        if model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_FREE:
-            free_addrs.append(model.jnt_qposadr[jid])
-    free_addrs = sorted(free_addrs)
-    if len(free_addrs) != len(qpos_seqs):
-        raise RuntimeError(
-            f"Expected {len(qpos_seqs)} freejoints, found {len(free_addrs)}")
-
-    with mujoco.viewer.launch_passive(model, data) as viewer:
-        played_once = False
-        while viewer.is_running():
-            if played_once and not loop:
-                time.sleep(0.05)
-                viewer.sync()
-                continue
-            for t in range(T):
-                if not viewer.is_running():
-                    break
-                for i, (qseq, addr) in enumerate(zip(qpos_seqs, free_addrs)):
-                    q = qseq[t]
-                    data.qpos[addr : addr + 36] = q
-                    data.qpos[addr + 1] += 1.5 * i  # y offset
-                mujoco.mj_forward(model, data)
-                viewer.sync()
-                time.sleep(dt)
-            played_once = True
 
 
 # ---------------------------------------------------------------------------

@@ -11,8 +11,8 @@ Writes:
   storage/data/latents/<run_name>/config.json
 
 Usage:
-  uv run python scripts/latents/train_diffusion.py
-  uv run python scripts/latents/train_diffusion.py --run_name diff_base --epochs 2000
+  uv run python scripts/diffusion/train_diffusion.py
+  uv run python scripts/diffusion/train_diffusion.py --run_name diff_base --epochs 2000
 """
 
 from __future__ import annotations
@@ -146,14 +146,14 @@ def train(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--vae_run",   type=str, default="cvae_k9",
+    ap.add_argument("--vae_run",   type=str, default="v2/cvae_v2",
                     help="ChunkVAE run dir containing chunk_diffusion_dataset.npz")
-    ap.add_argument("--run_name",  type=str, default="diff_base")
+    ap.add_argument("--run_name",  type=str, default="v2/diff_base")
     ap.add_argument("--T",         type=int, default=1000,
                     help="Number of diffusion timesteps.")
-    ap.add_argument("--d_model",   type=int, default=128)
+    ap.add_argument("--d_model",   type=int, default=256)
     ap.add_argument("--n_heads",   type=int, default=4)
-    ap.add_argument("--n_layers",  type=int, default=6)
+    ap.add_argument("--n_layers",  type=int, default=8)
     ap.add_argument("--ff_mult",   type=int, default=4)
     ap.add_argument("--epochs",    type=int, default=2000)
     ap.add_argument("--batch_size",type=int, default=256)

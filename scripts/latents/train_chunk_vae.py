@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from motion_latent.paths import FEAT_DIR, LATENTS_ROOT, STATS_PATH
-from motion_latent.vae.dataset import MotionChunkDataset
+from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.chunk_vae.model import ChunkVAE
 
 
@@ -89,7 +89,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--features",    type=Path,  default=FEAT_DIR)
     ap.add_argument("--stats",       type=Path,  default=STATS_PATH)
-    ap.add_argument("--run_name",    type=str,   default="cvae_base")
+    ap.add_argument("--run_name",    type=str,   default="v2/cvae_base")
     ap.add_argument("--H",           type=int,   default=100,
                     help="Chunk length in frames.")
     ap.add_argument("--latent_len",  type=int,   default=25,

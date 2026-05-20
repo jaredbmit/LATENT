@@ -119,6 +119,8 @@ def record_video(qpos_seqs: list[np.ndarray], xml_path: Path, freq: float,
                     data.qpos[addr : addr + 36] = qseq[t]
                     data.qpos[addr + 1] += 1.5 * i
                 mujoco.mj_forward(model, data)
+                # Track mean robot x-position so the camera follows forward motion.
+                cam.lookat[0] = float(np.mean([data.qpos[a] for a in free_addrs]))
                 renderer.update_scene(data, camera=cam)
                 writer.append_data(renderer.render())
 

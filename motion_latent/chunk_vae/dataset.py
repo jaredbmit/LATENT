@@ -17,12 +17,16 @@ class MotionChunkDataset(Dataset):
     and H can be changed freely without re-preprocessing.
 
     Each item is:
-      chunk : (H, D) float32 — normalised future frames (prediction target)
-      s_t   : (D,)  float32 — conditioning state (frame immediately before chunk)
+      chunk : (H, D)      float32 — normalised future frames (prediction target)
+      cond  : (n_cond, D) float32 — n_cond frames immediately preceding the chunk
+                                    (padded by repeating the first available frame
+                                     when the clip is too short)
     """
 
-    def __init__(self, features_dir: Path, norm_stats_path: Path, H: int) -> None:
-        self.H = H
+    def __init__(self, features_dir: Path, norm_stats_path: Path,
+                 H: int, n_cond: int = 1) -> None:
+        self.H      = H
+        self.n_cond = n_cond
         stats      = np.load(norm_stats_path)
         mean, std  = stats["mean"], stats["std"]   # (D,)
         self.mean  = mean.astype(np.float32)
@@ -41,11 +45,6 @@ class MotionChunkDataset(Dataset):
         self.offsets = offsets
         self.D = self.clips[0].shape[1] if self.clips else 0
 
-        # Per-feature std of one-step deltas — used to renormalise s_{t+1}-s_t
-        # for the delta-mode isometry loss (deltas are small and not unit var).
-        deltas = torch.cat([c[1:] - c[:-1] for c in self.clips], dim=0)
-        self.delta_std = deltas.std(dim=0).clamp_min(1e-6)   # (D,)
-
     @property
     def n_clips(self) -> int:
         return len(self.clips)
@@ -57,6 +56,13 @@ class MotionChunkDataset(Dataset):
         clip_idx = bisect.bisect_right(self.offsets, idx) - 1
         t        = idx - self.offsets[clip_idx]
         clip     = self.clips[clip_idx]           # (T, D)
-        s_t      = clip[t]                        # (D,)
         chunk    = clip[t + 1 : t + self.H + 1]  # (H, D)
-        return chunk, s_t
+
+        # n_cond frames ending at t (inclusive); pad at start if clip is too short
+        start  = max(0, t - self.n_cond + 1)
+        frames = clip[start : t + 1]              # (min(n_cond, t+1), D)
+        if frames.shape[0] < self.n_cond:
+            pad   = frames[:1].expand(self.n_cond - frames.shape[0], -1)
+            frames = torch.cat([pad, frames], dim=0)
+        cond = frames                             # (n_cond, D)
+        return chunk, cond

@@ -27,7 +27,7 @@ class Args:
     play_ref_motion: bool = False
     use_viewer: bool = False    # passive viewer (with display)
     use_renderer: bool = False  # renderer with video (headless mode)
-    task: str = "G1Tracking"
+    task: str = "G1TrackingTennis"
 
 
 @dataclass
@@ -83,7 +83,8 @@ def play(args: Args):
     policy = rt.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     state = env.reset()
 
-    len_traj = env.th.traj.data.qpos.shape[0] - len(env_cfg.reference_traj_config.name[env_cfg.reference_traj_config.name.keys()[0]]) - 1
+    n_clips = sum(len(v) for v in env_cfg.reference_traj_config.name.values())
+    len_traj = env.th.traj.data.qpos.shape[0] - n_clips - 1
     for i in tqdm(range(len_traj)):
         onnx_input = {"obs": state.obs["state"].reshape(1, -1).astype(np.float32)}
         action = policy.run(output_names, onnx_input)[0][0]

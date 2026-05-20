@@ -29,6 +29,7 @@ class State:
     obs: dict
 
 @lmj.registry.register("G1TrackingTennis", "tracking_play_env_class")
+@lmj.registry.register("G1TrackingTennisDR", "tracking_play_env_class")
 class PlayG1TrackingTennisEnv:
     mj_model: mujoco.MjModel
     mj_data: mujoco.MjData
@@ -43,6 +44,8 @@ class PlayG1TrackingTennisEnv:
         use_viewer=False,
         use_renderer=False,
         exp_name="debug",
+        action_delay_steps: int = 1,
+        obs_noise: bool = True,
     ):
         xml_path = consts.task_to_xml(with_racket=with_racket)
         if not isinstance(xml_path, str):
@@ -77,6 +80,9 @@ class PlayG1TrackingTennisEnv:
         self._config = config
         self.dt = dt
         self.sim_dt = sim_dt
+        self._action_delay_steps = action_delay_steps
+        self._obs_noise = obs_noise
+        self._action_buffer = None  # initialized in _reset_from_current_traj
         self.play_ref_motion = play_ref_motion
         self._config.reference_traj_config.random_start = False
         self._config.reference_traj_config.fixed_start_frame = 0
@@ -283,6 +289,15 @@ class PlayG1TrackingTennisEnv:
         # Reset excluded joints state
         self._reset_excluded_joints_state()
 
+        n_active = len(self.active_actuator_names)
+        if self._action_delay_steps > 0:
+            self._action_buffer = collections.deque(
+                [np.zeros(n_active)] * self._action_delay_steps,
+                maxlen=self._action_delay_steps,
+            )
+        else:
+            self._action_buffer = None
+
         info = {
             "step": 0,
             "last_motor_targets": self.mj_data.qpos[7:].copy(),
@@ -367,8 +382,14 @@ class PlayG1TrackingTennisEnv:
             # Update excluded joints random targets
             self._update_excluded_joints_targets(state.info["step"])
 
+            if self._action_buffer is not None:
+                delayed_action = self._action_buffer[0]
+                self._action_buffer.append(action)
+            else:
+                delayed_action = action
+
             ref_joint_qpos = np.array(qpos[7:])
-            active_motor_targets = ref_joint_qpos[self.active_actuator_ids] + action * self._config.action_scale
+            active_motor_targets = ref_joint_qpos[self.active_actuator_ids] + delayed_action * self._config.action_scale
 
             motor_targets = self._default_qpos.copy()
             motor_targets[self.active_actuator_ids] = active_motor_targets
@@ -461,6 +482,13 @@ class PlayG1TrackingTennisEnv:
         # joint
         joint_pos = self.mj_data.qpos[7:]
         joint_vel = self.mj_data.qvel[6:]
+
+        if self._obs_noise:
+            # uniform noise matching training noise_config scales
+            gyro_pelvis = gyro_pelvis + np.random.uniform(-0.2, 0.2, size=gyro_pelvis.shape)
+            gvec_pelvis = gvec_pelvis + np.random.uniform(-0.05, 0.05, size=gvec_pelvis.shape)
+            joint_pos = joint_pos + np.random.uniform(-0.03, 0.03, size=joint_pos.shape)
+            joint_vel = joint_vel + np.random.uniform(-1.5, 1.5, size=joint_vel.shape)
 
         # reference
         dif_joint_pos = traj_data.qpos[7:] - joint_pos

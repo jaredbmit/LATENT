@@ -18,7 +18,9 @@ See: https://arxiv.org/pdf/1707.06347.pdf
 """
 
 import functools
+import shutil
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
 from absl import logging
@@ -541,6 +543,7 @@ def train(
             continue
 
         # Process id == 0.
+        progress_fn(current_step, training_metrics)
         params = _unpmap(
             (
                 training_state.normalizer_params,
@@ -552,6 +555,10 @@ def train(
 
         if save_checkpoint_path is not None:
             checkpoint.save(save_checkpoint_path, current_step, params, ckpt_config)
+            # Keep only the latest checkpoint to avoid disk bloat
+            ckpt_subdirs = sorted(p for p in Path(save_checkpoint_path).iterdir() if p.is_dir())
+            for old in ckpt_subdirs[:-1]:
+                shutil.rmtree(old, ignore_errors=True)
 
     total_steps = current_step
     if not total_steps >= num_timesteps:

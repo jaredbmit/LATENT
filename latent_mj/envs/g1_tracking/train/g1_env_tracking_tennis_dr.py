@@ -37,6 +37,7 @@ from latent_mj.dr.domain_randomize_tracking import (
 
 ENABLE_PUSH = True
 EPISODE_LENGTH = 1000
+ACTION_DELAY_MAX = 2  # max steps of action latency DR (2 steps = 40ms at 50Hz)
 
 
 def g1_tracking_tennis_dr_task_config() -> config_dict.ConfigDict:
@@ -337,6 +338,9 @@ class G1TrackingTennisDREnv(g1_env_tracking_tennis.G1TrackingTennisEnv):
 
         rng, dr_ctrl_dict = domain_randomize_motor_ctrl(rng)
 
+        rng, delay_rng = jax.random.split(rng)
+        action_delay = jax.random.randint(delay_rng, shape=(), minval=0, maxval=ACTION_DELAY_MAX + 1)
+
         # Initialize excluded joints random target state
         rng, interval_rng, target_rng = jax.random.split(rng, 3)
         excluded_cfg = self._config.excluded_joints_config
@@ -379,6 +383,9 @@ class G1TrackingTennisDREnv(g1_env_tracking_tennis.G1TrackingTennisEnv):
             "kp_scale": dr_ctrl_dict["kp_scale"],
             "kd_scale": dr_ctrl_dict["kd_scale"],
             "rfi_lim_scale": dr_ctrl_dict["rfi_lim_scale"],
+            # action latency DR
+            "action_delay": action_delay,
+            "action_buffer": jp.zeros((ACTION_DELAY_MAX + 1, len(self.active_actuator_ids))),
         }
 
         metrics = {}
@@ -459,7 +466,14 @@ class G1TrackingTennisDREnv(g1_env_tracking_tennis.G1TrackingTennisEnv):
         state.info["excluded_targets"] = excluded_targets
         state.info["excluded_next_reset_step"] = next_reset_step
         
-        active_motor_targets = traj_data.qpos[7:][self.active_actuator_ids] + action * self._config.action_scale
+        # action latency: roll buffer, insert current action, apply delayed action
+        new_buffer = jp.roll(state.info["action_buffer"], -1, axis=0).at[-1].set(action)
+        state.info["action_buffer"] = new_buffer
+        delayed_action = jax.lax.dynamic_index_in_dim(
+            new_buffer, ACTION_DELAY_MAX - state.info["action_delay"], axis=0, keepdims=False
+        )
+
+        active_motor_targets = traj_data.qpos[7:][self.active_actuator_ids] + delayed_action * self._config.action_scale
         motor_targets = self._default_qpos.copy()
         motor_targets = motor_targets.at[self.active_actuator_ids].set(active_motor_targets)
         # Override excluded joints with random targets

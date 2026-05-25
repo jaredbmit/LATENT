@@ -35,7 +35,7 @@ import torch
 
 from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
 from motion_latent.chunk_vae.model import ChunkVAE
-from motion_latent.diffusion.model import MotionDiT
+from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.sampler import ddim_sample
 from motion_latent.diffusion.schedule import cosine_schedule
 from motion_latent.render import play_overlay, record_video
@@ -43,7 +43,7 @@ from motion_latent.features import canonical_to_qpos
 
 
 _LATENT_TYPES = {"motion_dit", "motion_dit_latent"}
-_RAW_TYPES    = {"motion_dit_raw"}
+_RAW_TYPES    = {"motion_dit_raw", "motion_mlp_raw"}
 
 
 def _load_default_qpos() -> np.ndarray:
@@ -115,7 +115,7 @@ def main() -> None:
     dit, dit_cfg = None, None
     vae_run      = args.vae_run or "v2/cvae_base"
     if args.mode in ("diffusion", "compare"):
-        dit, dit_cfg = MotionDiT.from_run(RUNS_ROOT / args.diff_run, device)
+        dit, dit_cfg = load_model(RUNS_ROOT / args.diff_run, device)
         vae_run      = args.vae_run or dit_cfg.get("vae_run", "v2/cvae_base")
         model_type   = dit_cfg.get("model_type", "motion_dit")
         print(f"DiT: {args.diff_run}  model_type={model_type}  "

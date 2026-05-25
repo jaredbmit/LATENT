@@ -42,7 +42,7 @@ import latent_mj as lmj
 from latent_mj.constant import WANDB_PATH_LOG
 from latent_mj.envs.g1_tracking import g1_tracking_constants_tennis as consts
 from motion_latent.chunk_vae.model import ChunkVAE
-from motion_latent.diffusion.model import MotionDiT
+from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.sampler import ddim_sample
 from motion_latent.diffusion.schedule import cosine_schedule
 from motion_latent.features import canonical_to_qpos
@@ -50,7 +50,7 @@ from motion_latent.obs import GYRO_SCALE, JOINT_VEL_SCALE
 from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
 
 
-_RAW_TYPES = {"motion_dit_raw"}
+_RAW_TYPES = {"motion_dit_raw", "motion_mlp_raw"}
 
 
 @dataclass
@@ -96,7 +96,7 @@ def _generate_chunk(diff_run: str, vae_run_override: str,
     """
     from motion_latent.diffusion.sampler import ddim_inpaint_sample, ddim_prepend_sample
 
-    dit, cfg = MotionDiT.from_run(RUNS_ROOT / diff_run, device)
+    dit, cfg = load_model(RUNS_ROOT / diff_run, device)
     model_type = cfg.get("model_type", "motion_dit")
     n_cond     = cfg.get("n_cond", 0)
     cond_mode  = cfg.get("cond_mode", "none")

@@ -29,7 +29,7 @@ from .schedule import Schedule, cosine_schedule
 
 
 _LATENT_TYPES = {"motion_dit", "motion_dit_latent"}
-_RAW_TYPES    = {"motion_dit_raw"}
+_RAW_TYPES    = {"motion_dit_raw", "motion_mlp_raw"}
 
 
 def _load_norm_stats(run_name: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:

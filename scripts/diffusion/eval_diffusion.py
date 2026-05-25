@@ -35,13 +35,13 @@ from scipy.linalg import sqrtm
 from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.chunk_vae.model import ChunkVAE
-from motion_latent.diffusion.model import MotionDiT
+from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.sampler import ddim_sample
 from motion_latent.diffusion.schedule import cosine_schedule
 
 
 _LATENT_TYPES = {"motion_dit", "motion_dit_latent"}
-_RAW_TYPES    = {"motion_dit_raw"}
+_RAW_TYPES    = {"motion_dit_raw", "motion_mlp_raw"}
 
 
 def frechet_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -139,7 +139,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    dit, dit_cfg = MotionDiT.from_run(RUNS_ROOT / args.diff_run, device)
+    dit, dit_cfg = load_model(RUNS_ROOT / args.diff_run, device)
     model_type   = dit_cfg.get("model_type", "motion_dit")
     vae_run      = args.vae_run or dit_cfg.get("vae_run")
     is_raw       = model_type in _RAW_TYPES

@@ -31,7 +31,7 @@ import mujoco
 import numpy as np
 
 from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
-from motion_latent.diffusion.model import MotionDiT
+from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.rollout import generate_trajectory
 from motion_latent.render import play_overlay, record_video
 from motion_latent.features import canonical_to_qpos
@@ -63,7 +63,7 @@ def main() -> None:
     kid          = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "home")
     default_qpos = m.key_qpos[kid, 7:].copy()
 
-    dit, cfg = MotionDiT.from_run(RUNS_ROOT / args.diff_run, device)
+    dit, cfg = load_model(RUNS_ROOT / args.diff_run, device)
     model_type = cfg.get("model_type", "motion_dit")
     cond_mode  = cfg.get("cond_mode", "none")
     n_cond     = cfg.get("n_cond", 0)

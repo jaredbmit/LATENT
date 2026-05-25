@@ -1,23 +1,31 @@
-"""MotionDiT: Diffusion Transformer denoiser for motion chunk latents.
+"""Diffusion denoiser models for motion chunks.
 
-Input/output shape: (B, latent_len, latent_dim) — the noised latent z_t and
-the predicted noise eps share this shape.
+Two backbones share the same forward signature and conditioning interface:
 
-Architecture (Peebles & Xie 2023, DiT with AdaLN-zero):
-  in_proj    : Linear(latent_dim → d_model)         [or latent_dim+cond_dim for input_concat]
-  pos_emb    : learnable (1, latent_len, d_model)
-  blocks     : n_layers × DiTBlock  (self-attention + MLP, AdaLN-zero time cond.)
-  out_norm   : LayerNorm
-  out_proj   : Linear(d_model → latent_dim)  zero-initialised
+  MotionDiT  — Diffusion Transformer (Peebles & Xie 2023, AdaLN-zero).
+               Operates on the sequence of latent/feature tokens; has learnable
+               positional embeddings and self-attention across the time axis.
+
+  MotionMLP  — Flat residual MLP with no spatial inductive bias.
+               Flattens the full (latent_len, latent_dim) input to a vector,
+               appends a small sinusoidal timestep embedding, and passes through
+               a stack of pre-norm residual blocks.
+
+Both accept:
+  z_t  : (B, latent_len, latent_dim)  — noised input
+  t    : (B,) int                     — diffusion timestep
+  cond : (B, cond_dim) or None        — optional conditioning vector
 
 Conditioning modes (cond_mode):
-  "none"         : unconditional (cond argument ignored).
-  "adaln"        : cond (B, cond_dim) projected to d_model and added to the time
-                   embedding before AdaLN modulation — same pathway as timestep.
-  "input_concat" : cond (B, cond_dim) broadcast to all positions and concatenated
-                   to z_t channel-wise before in_proj.
-  "inpaint"      : handled entirely at sampling time; model is unconditional.
-  "prepend"      : handled entirely at sampling time; model is unconditional.
+  "none"         : unconditional.
+  "input_concat" : cond vector appended to the flat input (MLP) or broadcast
+                   and concatenated channel-wise before in_proj (DiT).
+  "adaln"        : DiT only — cond projected to d_model and summed into the
+                   time embedding before AdaLN modulation.
+  "inpaint"      : sampler-only; model is unconditional.
+  "prepend"      : sampler-only; model is unconditional.
+
+use load_model(run_dir, device) to instantiate either class from a saved run.
 """
 
 from __future__ import annotations
@@ -167,3 +175,108 @@ class MotionDiT(nn.Module):
         ).to(device)
         model.load_state_dict(torch.load(Path(run_dir) / "model.pt", map_location=device))
         return model.eval(), cfg
+
+
+# ---------------------------------------------------------------------------
+# MLP denoiser
+# ---------------------------------------------------------------------------
+
+class _MLPBlock(nn.Module):
+    """Pre-norm residual MLP block."""
+
+    def __init__(self, d_hidden: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_hidden)
+        self.net  = nn.Sequential(
+            nn.Linear(d_hidden, d_hidden), nn.SiLU(),
+            nn.Linear(d_hidden, d_hidden),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(self.norm(x))
+
+
+class MotionMLP(nn.Module):
+    """Flat residual MLP denoiser — no spatial inductive bias.
+
+    The input (B, latent_len, latent_dim) is flattened to (B, latent_len*latent_dim),
+    concatenated with a sinusoidal timestep embedding and (optionally) a conditioning
+    vector, then processed by a stack of residual blocks before being projected back.
+
+    Supported cond_mode values: "none" | "inpaint" | "prepend" | "input_concat".
+    "adaln" is not supported (no per-layer modulation pathway).
+
+    Note on scale: the flat input dimension is latent_len * latent_dim (e.g. 6400
+    for H=100, D=64), so in_proj and out_proj dominate the parameter count even at
+    modest d_hidden.  Use d_hidden ≥ 256 for reasonable expressiveness.
+    """
+
+    def __init__(self, latent_len: int, latent_dim: int,
+                 d_hidden: int = 256, n_layers: int = 6, t_dim: int = 64,
+                 cond_dim: int = 0, cond_mode: str = "none") -> None:
+        super().__init__()
+        self.latent_len = latent_len
+        self.latent_dim = latent_dim
+        self.cond_dim   = cond_dim
+        self.cond_mode  = cond_mode
+
+        flat_dim = latent_len * latent_dim
+        in_dim   = flat_dim + t_dim + (cond_dim if cond_mode == "input_concat" else 0)
+
+        self.time_emb = TimestepEmbedding(t_dim)
+        self.in_proj  = nn.Linear(in_dim, d_hidden)
+        self.blocks   = nn.ModuleList([_MLPBlock(d_hidden) for _ in range(n_layers)])
+        self.out_proj = nn.Linear(d_hidden, flat_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z_t: torch.Tensor, t: torch.Tensor,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
+        """z_t: (B, L, D)  t: (B,) int  cond: (B, cond_dim) or None → eps same shape."""
+        B = z_t.shape[0]
+        x  = z_t.reshape(B, -1)        # (B, L*D)
+        te = self.time_emb(t)           # (B, t_dim)
+
+        parts = [x, te]
+        if self.cond_mode == "input_concat" and cond is not None:
+            parts.append(cond)          # (B, cond_dim)
+        x = torch.cat(parts, dim=-1)
+
+        x = self.in_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.out_proj(x).reshape(B, self.latent_len, self.latent_dim)
+
+    @classmethod
+    def from_run(cls, run_dir: Path, device: torch.device) -> tuple["MotionMLP", dict]:
+        cfg   = json.loads((Path(run_dir) / "config.json").read_text())
+        model = cls(
+            latent_len=cfg["latent_len"], latent_dim=cfg["latent_dim"],
+            d_hidden=cfg["d_model"],      n_layers=cfg["n_layers"],
+            t_dim=cfg.get("t_dim", 64),
+            cond_dim=cfg.get("cond_dim", 0),
+            cond_mode=cfg.get("cond_mode", "none"),
+        ).to(device)
+        model.load_state_dict(torch.load(Path(run_dir) / "model.pt", map_location=device))
+        return model.eval(), cfg
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+_DIT_TYPES = {"motion_dit", "motion_dit_latent", "motion_dit_raw"}
+_MLP_TYPES = {"motion_mlp_raw"}
+
+
+def load_model(run_dir: Path,
+               device: torch.device) -> tuple[nn.Module, dict]:
+    """Instantiate and load the correct denoiser from a run directory."""
+    run_dir    = Path(run_dir)
+    cfg        = json.loads((run_dir / "config.json").read_text())
+    model_type = cfg.get("model_type", "motion_dit")
+    if model_type in _DIT_TYPES:
+        return MotionDiT.from_run(run_dir, device)
+    if model_type in _MLP_TYPES:
+        return MotionMLP.from_run(run_dir, device)
+    raise ValueError(f"Unknown model_type: {model_type!r}")

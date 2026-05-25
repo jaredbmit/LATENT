@@ -53,11 +53,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
-from motion_latent.diffusion.model import MotionDiT
+from motion_latent.diffusion.model import MotionDiT, MotionMLP
 from motion_latent.diffusion.schedule import cosine_schedule
 
 
@@ -109,26 +108,42 @@ def train(args: argparse.Namespace) -> None:
     z_norm     = (all_seqs - state_mean) / state_std
     print(f"normalised: mean={z_norm.mean():.4f}  std={z_norm.std():.4f}")
 
-    loader = DataLoader(TensorDataset(torch.from_numpy(z_norm).float()),
-                        batch_size=args.batch_size, shuffle=True, drop_last=True)
+    # Dataset fits in GPU memory — keep it there and sample minibatches directly
+    # to avoid CPU→GPU transfers every step.
+    z_gpu      = torch.from_numpy(z_norm).float().to(device)
+    n_samples  = z_gpu.shape[0]
+    n_batches  = n_samples // args.batch_size
 
     # --- Schedule & model ---
     # inpaint / prepend : model sees full [cond|chunk] sequence → latent_len = N + H
     # adaln / input_concat : cond is injected internally → latent_len = H only
     _MODEL_COND_MODES = {"adaln", "input_concat"}
-    cond_mode = args.cond_mode
+    cond_mode    = args.cond_mode
+    backbone     = args.model_type
+
+    if backbone == "mlp" and cond_mode == "adaln":
+        raise ValueError("MotionMLP does not support cond_mode='adaln'.")
+
     model_latent_len = H if cond_mode in _MODEL_COND_MODES else seq_len
     cond_dim         = N * D if cond_mode in _MODEL_COND_MODES else 0
 
     schedule = cosine_schedule(args.T)
-    model    = MotionDiT(
-        latent_len=model_latent_len, latent_dim=D,
-        d_model=args.d_model, n_heads=args.n_heads,
-        n_layers=args.n_layers, ff_mult=args.ff_mult,
-        cond_dim=cond_dim, cond_mode=cond_mode,
-    ).to(device)
+    if backbone == "mlp":
+        model = MotionMLP(
+            latent_len=model_latent_len, latent_dim=D,
+            d_hidden=args.d_model,       n_layers=args.n_layers,
+            t_dim=args.t_dim,
+            cond_dim=cond_dim,           cond_mode=cond_mode,
+        ).to(device)
+    else:
+        model = MotionDiT(
+            latent_len=model_latent_len, latent_dim=D,
+            d_model=args.d_model,        n_heads=args.n_heads,
+            n_layers=args.n_layers,      ff_mult=args.ff_mult,
+            cond_dim=cond_dim,           cond_mode=cond_mode,
+        ).to(device)
     print(f"parameters: {sum(p.numel() for p in model.parameters()):,}  "
-          f"cond_mode={cond_mode}  cond_dim={cond_dim}")
+          f"backbone={backbone}  cond_mode={cond_mode}  cond_dim={cond_dim}")
 
     opt       = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
@@ -138,12 +153,17 @@ def train(args: argparse.Namespace) -> None:
     out_dir = RUNS_ROOT / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    import time
+    t0 = time.perf_counter()
+    steps_since_log = 0
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         loss_sum = 0.0
-        for (z0,) in loader:
-            z0  = z0.to(device)           # (B, seq_len, D)
-            B   = z0.shape[0]
+        perm = torch.randperm(n_samples, device=device)
+        for bi in range(n_batches):
+            z0 = z_gpu[perm[bi * args.batch_size : (bi + 1) * args.batch_size]]
+            B  = z0.shape[0]
             t   = torch.randint(1, args.T + 1, (B,), device=device)
             ab_t = ab[t].view(B, 1, 1)
 
@@ -194,11 +214,16 @@ def train(args: argparse.Namespace) -> None:
             opt.zero_grad(); loss.backward(); opt.step()
             ema.update(model)
             loss_sum += loss.item()
+            steps_since_log += 1
         scheduler.step()
 
         if epoch % args.log_every == 0:
+            elapsed = time.perf_counter() - t0
+            ms_per_step = 1000 * elapsed / steps_since_log
             print(f"epoch {epoch:5d}  lr={scheduler.get_last_lr()[0]:.2e}  "
-                  f"loss={loss_sum/len(loader):.5f}")
+                  f"loss={loss_sum/n_batches:.5f}  {ms_per_step:.1f}ms/step")
+            t0 = time.perf_counter()
+            steps_since_log = 0
 
     torch.save(ema.shadow,         out_dir / "model.pt")
     torch.save(model.state_dict(), out_dir / "model_raw.pt")
@@ -206,7 +231,7 @@ def train(args: argparse.Namespace) -> None:
 
     cfg = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     cfg.update({
-        "model_type": "motion_dit_raw",
+        "model_type": "motion_mlp_raw" if backbone == "mlp" else "motion_dit_raw",
         "latent_len": model_latent_len,
         "H":          H,
         "n_cond":     N,
@@ -228,10 +253,15 @@ def main() -> None:
     ap.add_argument("--cond_mode",  type=str,   default="none",
                     choices=["none", "inpaint", "prepend", "adaln", "input_concat"],
                     help="Conditioning mechanism.")
+    ap.add_argument("--model_type", type=str,   default="dit", choices=["dit", "mlp"],
+                    help="Denoiser backbone: DiT (transformer) or MLP (no spatial bias).")
     ap.add_argument("--T",          type=int,   default=1000)
-    ap.add_argument("--d_model",    type=int,   default=256)
+    ap.add_argument("--d_model",    type=int,   default=128,
+                    help="d_model for DiT; d_hidden for MLP. Consider ≥256 for MLP.")
     ap.add_argument("--n_heads",    type=int,   default=4)
-    ap.add_argument("--n_layers",   type=int,   default=8)
+    ap.add_argument("--n_layers",   type=int,   default=6)
+    ap.add_argument("--t_dim",      type=int,   default=64,
+                    help="Timestep embedding dim (MLP only).")
     ap.add_argument("--ff_mult",    type=int,   default=4)
     ap.add_argument("--epochs",     type=int,   default=2000)
     ap.add_argument("--batch_size", type=int,   default=256)

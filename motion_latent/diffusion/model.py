@@ -4,11 +4,20 @@ Input/output shape: (B, latent_len, latent_dim) — the noised latent z_t and
 the predicted noise eps share this shape.
 
 Architecture (Peebles & Xie 2023, DiT with AdaLN-zero):
-  in_proj    : Linear(latent_dim → d_model)
+  in_proj    : Linear(latent_dim → d_model)         [or latent_dim+cond_dim for input_concat]
   pos_emb    : learnable (1, latent_len, d_model)
   blocks     : n_layers × DiTBlock  (self-attention + MLP, AdaLN-zero time cond.)
   out_norm   : LayerNorm
   out_proj   : Linear(d_model → latent_dim)  zero-initialised
+
+Conditioning modes (cond_mode):
+  "none"         : unconditional (cond argument ignored).
+  "adaln"        : cond (B, cond_dim) projected to d_model and added to the time
+                   embedding before AdaLN modulation — same pathway as timestep.
+  "input_concat" : cond (B, cond_dim) broadcast to all positions and concatenated
+                   to z_t channel-wise before in_proj.
+  "inpaint"      : handled entirely at sampling time; model is unconditional.
+  "prepend"      : handled entirely at sampling time; model is unconditional.
 """
 
 from __future__ import annotations
@@ -88,18 +97,36 @@ class DiTBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MotionDiT(nn.Module):
-    """Denoiser for latents of shape (B, latent_len, latent_dim)."""
+    """Denoiser for latents of shape (B, latent_len, latent_dim).
+
+    Args:
+        cond_dim  : dimensionality of the external conditioning vector.
+                    Ignored when cond_mode is "none", "inpaint", or "prepend".
+        cond_mode : one of "none" | "adaln" | "input_concat" | "inpaint" | "prepend".
+                    "inpaint" and "prepend" are sampler-only; the model is
+                    unconditional and cond_dim / cond_proj are not created.
+    """
+
+    _SAMPLER_ONLY_MODES = {"inpaint", "prepend"}
 
     def __init__(self, latent_len: int, latent_dim: int,
                  d_model: int = 128, n_heads: int = 4,
-                 n_layers: int = 6, ff_mult: int = 4) -> None:
+                 n_layers: int = 6, ff_mult: int = 4,
+                 cond_dim: int = 0, cond_mode: str = "none") -> None:
         super().__init__()
         self.latent_len = latent_len
         self.latent_dim = latent_dim
+        self.cond_dim   = cond_dim
+        self.cond_mode  = cond_mode
 
-        self.in_proj  = nn.Linear(latent_dim, d_model)
+        in_features = latent_dim + cond_dim if cond_mode == "input_concat" else latent_dim
+        self.in_proj  = nn.Linear(in_features, d_model)
         self.pos_emb  = nn.Parameter(torch.zeros(1, latent_len, d_model))
         self.time_emb = TimestepEmbedding(d_model)
+
+        if cond_mode == "adaln":
+            self.cond_proj = nn.Linear(cond_dim, d_model)
+
         self.blocks   = nn.ModuleList(
             [DiTBlock(d_model, n_heads, ff_mult) for _ in range(n_layers)]
         )
@@ -110,10 +137,19 @@ class MotionDiT(nn.Module):
 
         nn.init.normal_(self.pos_emb, std=0.02)
 
-    def forward(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """z_t: (B, latent_len, latent_dim)  t: (B,) int  → eps same shape."""
-        x = self.in_proj(z_t) + self.pos_emb
+    def forward(self, z_t: torch.Tensor, t: torch.Tensor,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
+        """z_t: (B, L, latent_dim)  t: (B,) int  cond: (B, cond_dim) or None → eps."""
+        if self.cond_mode == "input_concat":
+            cond_exp = cond.unsqueeze(1).expand(-1, z_t.shape[1], -1)  # (B, L, cond_dim)
+            x = self.in_proj(torch.cat([z_t, cond_exp], dim=-1)) + self.pos_emb
+        else:
+            x = self.in_proj(z_t) + self.pos_emb
+
         c = self.time_emb(t)
+        if self.cond_mode == "adaln":
+            c = c + self.cond_proj(cond)
+
         for block in self.blocks:
             x = block(x, c)
         return self.out_proj(self.out_norm(x))
@@ -126,6 +162,8 @@ class MotionDiT(nn.Module):
             latent_len=cfg["latent_len"], latent_dim=cfg["latent_dim"],
             d_model=cfg["d_model"],       n_heads=cfg["n_heads"],
             n_layers=cfg["n_layers"],     ff_mult=cfg["ff_mult"],
+            cond_dim=cfg.get("cond_dim", 0),
+            cond_mode=cfg.get("cond_mode", "none"),
         ).to(device)
         model.load_state_dict(torch.load(Path(run_dir) / "model.pt", map_location=device))
         return model.eval(), cfg

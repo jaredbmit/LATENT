@@ -5,8 +5,8 @@ Reads:
   storage/data/vae/norm_stats.npz
 
 Writes:
-  storage/data/latents/<run_name>/model.pt
-  storage/data/latents/<run_name>/config.json
+  storage/runs/<run_name>/model.pt
+  storage/runs/<run_name>/config.json
 
 Usage:
   uv run python scripts/latents/train_chunk_vae.py
@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from motion_latent.paths import FEAT_DIR, LATENTS_ROOT, STATS_PATH
+from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.chunk_vae.model import ChunkVAE
 
@@ -48,7 +48,7 @@ def train(args: argparse.Namespace) -> None:
     opt       = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-5)
 
-    out_dir = LATENTS_ROOT / args.run_name
+    out_dir = RUNS_ROOT / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):

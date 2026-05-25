@@ -32,7 +32,7 @@ import numpy as np
 import torch
 from scipy.linalg import sqrtm
 
-from motion_latent.paths import FEAT_DIR, LATENTS_ROOT, STATS_PATH
+from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.chunk_vae.model import ChunkVAE
 from motion_latent.diffusion.model import MotionDiT
@@ -90,16 +90,21 @@ def report(name: str, chunks: np.ndarray, real: np.ndarray, flat_real: np.ndarra
           f"mean_err={mean_err:.4f}  std_err={std_err:.4f}  nn_dist={mem:.4f}")
 
 
+def _load_norm_stats(run_name: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    stats = np.load(RUNS_ROOT / run_name / "norm_stats.npz")
+    mean  = torch.tensor(stats["mean"].astype(np.float32), device=device)
+    std   = torch.tensor(stats["std"].astype(np.float32),  device=device)
+    return mean, std
+
+
 def sample_diffusion(dit: MotionDiT, cfg: dict, n: int, device: torch.device,
                      ddim_steps: int) -> np.ndarray:
     """Draw n chunks in normalised feature space, routing by model_type."""
-    schedule  = cosine_schedule(cfg["T"])
-    z_norm    = ddim_sample(dit, schedule, n, device, steps=ddim_steps)
+    schedule = cosine_schedule(cfg["T"])
+    z_norm   = ddim_sample(dit, schedule, n, device, steps=ddim_steps)
 
-    lat_mean = torch.tensor(np.array(cfg["latent_mean"], dtype=np.float32), device=device)
-    lat_std  = torch.tensor(np.maximum(np.array(cfg["latent_std"], dtype=np.float32), 1e-4),
-                            device=device)
-    z_unnorm = z_norm * lat_std + lat_mean       # (n, latent_len, latent_dim)
+    mean, std = _load_norm_stats(cfg["run_name"], device)
+    z_unnorm  = z_norm * std + mean   # (n, latent_len, latent_dim)
 
     model_type = cfg.get("model_type", "motion_dit")
     if model_type in _RAW_TYPES:
@@ -110,7 +115,7 @@ def sample_diffusion(dit: MotionDiT, cfg: dict, n: int, device: torch.device,
     vae_run = cfg.get("vae_run")
     if not vae_run:
         raise ValueError("config.json missing 'vae_run' for latent diffusion model.")
-    vae, _ = ChunkVAE.from_run(LATENTS_ROOT / vae_run, device)
+    vae, _ = ChunkVAE.from_run(RUNS_ROOT / vae_run, device)
     with torch.no_grad():
         return vae.decode(z_unnorm).cpu().numpy()    # (n, H, D)
 
@@ -119,7 +124,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--diff_run",   type=str, default="v2/diff_base",
-                    help="Run name under storage/data/latents/. model_type is auto-detected.")
+                    help="Run name under storage/runs/. model_type is auto-detected.")
     ap.add_argument("--vae_run",    type=str, default=None,
                     help="Override VAE run for Gaussian baseline (raw diffusion only).")
     ap.add_argument("--H",          type=int, default=100,
@@ -134,7 +139,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    dit, dit_cfg = MotionDiT.from_run(LATENTS_ROOT / args.diff_run, device)
+    dit, dit_cfg = MotionDiT.from_run(RUNS_ROOT / args.diff_run, device)
     model_type   = dit_cfg.get("model_type", "motion_dit")
     vae_run      = args.vae_run or dit_cfg.get("vae_run")
     is_raw       = model_type in _RAW_TYPES
@@ -148,7 +153,7 @@ def main() -> None:
     else:
         if vae_run is None:
             raise ValueError("vae_run not found in config and --vae_run not specified.")
-        data  = np.load(LATENTS_ROOT / vae_run / "chunk_diffusion_dataset.npz")
+        data  = np.load(RUNS_ROOT / vae_run / "chunk_diffusion_dataset.npz")
         real  = data["states"].astype(np.float32)   # (M, H, D)
 
     n = real.shape[0] if args.n == 0 else min(args.n, real.shape[0])
@@ -160,13 +165,10 @@ def main() -> None:
 
         gauss = None
         if vae_run is not None:
-            data     = np.load(LATENTS_ROOT / vae_run / "chunk_diffusion_dataset.npz")
-            lat_mean = torch.tensor(data["latent_mean"].astype(np.float32), device=device)
-            lat_std  = torch.tensor(np.maximum(data["latent_std"].astype(np.float32), 1e-4),
-                                    device=device)
-            vae, _ = ChunkVAE.from_run(LATENTS_ROOT / vae_run, device)
-            zg     = vae.sample(n, device) * lat_std + lat_mean
-            gauss  = vae.decode(zg).cpu().numpy()
+            mean, std = _load_norm_stats(vae_run, device)
+            vae, _    = ChunkVAE.from_run(RUNS_ROOT / vae_run, device)
+            zg        = vae.sample(n, device) * std + mean
+            gauss     = vae.decode(zg).cpu().numpy()
 
     # Within-training NN baseline: first half → second half (disjoint).
     half     = real.shape[0] // 2

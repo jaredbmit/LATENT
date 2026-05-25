@@ -1,4 +1,4 @@
-"""DDIM samplers for MotionDiT: unconditional, inpainting, and prepend-conditioned."""
+"""DDIM samplers for MotionDiT: unconditional, inpainting, prepend, AdaLN, and input-concat."""
 
 from __future__ import annotations
 
@@ -22,8 +22,13 @@ def ddim_sample(
     n: int,
     device: torch.device,
     steps: int = 50,
+    cond: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Draw n unconditional samples via deterministic DDIM (η=0).
+    """Draw n samples via deterministic DDIM (η=0).
+
+    Args:
+        cond : (n, cond_dim) conditioning vector for adaln / input_concat models.
+               Ignored for unconditional models (cond_mode "none", "inpaint", "prepend").
 
     Returns (n, latent_len, latent_dim) in normalised model space.
     Caller must un-normalise before passing to ChunkVAE.decode.
@@ -33,10 +38,13 @@ def ddim_sample(
     # Descending subsequence T → 0. t_next=0 gives ᾱ[0]=1, landing exactly on z0_hat.
     indices = torch.linspace(T, 0, steps + 1).long()
 
+    if cond is not None:
+        cond = cond.to(device)
+
     z = torch.randn(n, model.latent_len, model.latent_dim, device=device)
     for i in range(steps):
         ab_now, ab_next = ab[indices[i]], ab[indices[i + 1]]
-        eps_hat = model(z, indices[i].expand(n).to(device))
+        eps_hat = model(z, indices[i].expand(n).to(device), cond=cond)
         z = _ddim_step(z, eps_hat, ab_now, ab_next)
     return z
 
@@ -50,6 +58,7 @@ def ddim_inpaint_sample(
     steps: int = 50,
     known_z0: torch.Tensor | None = None,
     known_mask: torch.Tensor | None = None,
+    cond: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """DDIM with replacement inpainting over a known (clean) prefix.
 
@@ -63,11 +72,12 @@ def ddim_inpaint_sample(
                      where known_mask=True are used. Pass None for unconditional.
         known_mask : (latent_len,) bool tensor — True = constrained positions.
                      Pass None to skip inpainting (equivalent to ddim_sample).
+        cond       : (n, cond_dim) optional vector for adaln / input_concat models.
 
     Returns (n, latent_len, latent_dim) in normalised model space.
     """
     if known_z0 is None or known_mask is None:
-        return ddim_sample(model, schedule, n, device, steps)
+        return ddim_sample(model, schedule, n, device, steps, cond=cond)
 
     T   = len(schedule.betas)
     ab  = schedule.alphas_bar.to(device)
@@ -75,6 +85,8 @@ def ddim_inpaint_sample(
 
     known_z0   = known_z0.to(device)        # (n, L, d)
     known_mask = known_mask.to(device)      # (L,) bool
+    if cond is not None:
+        cond = cond.to(device)
 
     z = torch.randn(n, model.latent_len, model.latent_dim, device=device)
 
@@ -87,7 +99,7 @@ def ddim_inpaint_sample(
         z_known_noisy = ab_now.sqrt() * known_z0 + (1 - ab_now).sqrt() * eps_k
         z[:, known_mask] = z_known_noisy[:, known_mask]
 
-        eps_hat = model(z, t_now.expand(n).to(device))
+        eps_hat = model(z, t_now.expand(n).to(device), cond=cond)
         z = _ddim_step(z, eps_hat, ab_now, ab_next)
 
     # Final hard replacement: ensure known positions are exactly the clean values.
@@ -135,8 +147,8 @@ def ddim_prepend_sample(
         t_now, t_next    = indices[i], indices[i + 1]
         ab_now, ab_next  = ab[t_now], ab[t_next]
 
-        z_in    = torch.cat([cond_z0, z], dim=1)                      # (n, n_cond+H, d)
-        eps_hat = model(z_in, t_now.expand(n).to(device))[:, n_cond:] # (n, H, d)
+        z_in    = torch.cat([cond_z0, z], dim=1)                           # (n, n_cond+H, d)
+        eps_hat = model(z_in, t_now.expand(n).to(device))[:, n_cond:]      # (n, H, d)
         z       = _ddim_step(z, eps_hat, ab_now, ab_next)
 
     return torch.cat([cond_z0, z], dim=1)   # (n, n_cond+H, d)

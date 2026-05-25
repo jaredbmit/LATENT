@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 import mujoco
-from motion_latent.paths import FEAT_DIR, G1_XML, LATENTS_ROOT, META_PATH, STATS_PATH
+from motion_latent.paths import FEAT_DIR, G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
 from motion_latent.render import play_overlay, record_video
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.features import canonical_to_qpos
@@ -49,7 +49,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run",       type=str,  default="cvae_base",
-                    help="Run name under storage/data/latents/")
+                    help="Run name under storage/runs/")
     ap.add_argument("--mode",      type=str,  default="sample",
                     choices=["recon", "sample"])
     ap.add_argument("--n_samples", type=int,  default=2,
@@ -69,7 +69,7 @@ def main() -> None:
     rng    = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
-    run_dir      = LATENTS_ROOT / args.run
+    run_dir      = RUNS_ROOT / args.run
     model, cfg   = ChunkVAE.from_run(run_dir, device)
     default_qpos = _load_default_qpos()
     print(f"  H={model.H}  latent_len={model.latent_len}  latent_dim={model.latent_dim}")

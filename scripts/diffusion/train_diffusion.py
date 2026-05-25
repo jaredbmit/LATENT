@@ -1,14 +1,13 @@
 """Train a latent diffusion model (DDPM, DiT denoiser) over ChunkVAE latents.
 
 Reads:
-  storage/data/latents/<vae_run>/chunk_diffusion_dataset.npz
-    latents     : (N, latent_len, latent_dim)
-    latent_mean : (latent_len, latent_dim)
-    latent_std  : (latent_len, latent_dim)
+  storage/runs/<vae_run>/chunk_diffusion_dataset.npz
+    latents : (N, latent_len, latent_dim)
 
 Writes:
-  storage/data/latents/<run_name>/model.pt
-  storage/data/latents/<run_name>/config.json
+  storage/runs/<run_name>/model.pt
+  storage/runs/<run_name>/norm_stats.npz  (channel-wise mean/std, shape (latent_dim,))
+  storage/runs/<run_name>/config.json
 
 Usage:
   uv run python scripts/diffusion/train_diffusion.py
@@ -26,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from motion_latent.paths import LATENTS_ROOT
+from motion_latent.paths import RUNS_ROOT
 from motion_latent.diffusion.model import MotionDiT
 from motion_latent.diffusion.schedule import cosine_schedule
 
@@ -57,18 +56,18 @@ def train(args: argparse.Namespace) -> None:
     print(f"device: {device}")
 
     # --- Load latents ---
-    dataset_path = LATENTS_ROOT / args.vae_run / "chunk_diffusion_dataset.npz"
-    data = np.load(dataset_path)
-    latents     = data["latents"].astype(np.float32)    # (N, latent_len, latent_dim)
-    latent_mean = data["latent_mean"].astype(np.float32)
-    latent_std  = data["latent_std"].astype(np.float32)
-    # Defensive guard for datasets encoded before the std floor was applied.
-    latent_std  = np.maximum(latent_std, 1e-4)
+    dataset_path = RUNS_ROOT / args.vae_run / "chunk_diffusion_dataset.npz"
+    data    = np.load(dataset_path)
+    latents = data["latents"].astype(np.float32)    # (N, latent_len, latent_dim)
 
     latent_len, latent_dim = latents.shape[1], latents.shape[2]
     print(f"latents: {latents.shape}  latent_len={latent_len}  latent_dim={latent_dim}")
 
-    # Per-position standardisation
+    # Channel-wise normalisation across all samples and positions.
+    flat        = latents.reshape(-1, latent_dim)
+    latent_mean = flat.mean(axis=0)                     # (latent_dim,)
+    latent_std  = np.maximum(flat.std(axis=0), 1e-4)   # (latent_dim,)
+
     z_norm = (latents - latent_mean) / latent_std      # (N, latent_len, latent_dim)
     print(f"normalised: mean={z_norm.mean():.4f}  std={z_norm.std():.4f}")
 
@@ -94,7 +93,7 @@ def train(args: argparse.Namespace) -> None:
 
     ab = schedule.alphas_bar.to(device)   # (T+1,)
 
-    out_dir = LATENTS_ROOT / args.run_name
+    out_dir = RUNS_ROOT / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Training loop ---
@@ -131,13 +130,12 @@ def train(args: argparse.Namespace) -> None:
     # EMA weights are the ones to sample from; keep the raw weights alongside.
     torch.save(ema.shadow,         out_dir / "model.pt")
     torch.save(model.state_dict(), out_dir / "model_raw.pt")
+    np.savez(out_dir / "norm_stats.npz", mean=latent_mean, std=latent_std)
     cfg = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     cfg.update({
-        "latent_len":   latent_len,
-        "latent_dim":   latent_dim,
-        "latent_mean":  latent_mean.tolist(),
-        "latent_std":   latent_std.tolist(),
-        "model_type":   "motion_dit",
+        "latent_len":  latent_len,
+        "latent_dim":  latent_dim,
+        "model_type":  "motion_dit",
     })
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"saved → {out_dir}")

@@ -7,24 +7,29 @@ difference is the input tensor:
   raw diffusion    : normalised motion chunks   (N, H=100,         D=64)
 
 Conditioning modes (--cond_mode):
-  none    — unconditional generation (default, matches rdiff_base behaviour)
-  inpaint — mask the first n_cond frames as known; model denoises [n_cond:]
-            conditioned on noised versions of the context (replacement inpainting)
-  prepend — prepend clean context frames; model denoises [n_cond:] attending
-            to the unnoised prefix
+  none         — unconditional generation (default, matches rdiff_base behaviour)
+  inpaint      — mask the first n_cond frames as known; model denoises [n_cond:]
+                 conditioned on noised versions of the context (replacement inpainting)
+  prepend      — prepend clean context frames; model denoises [n_cond:] attending
+                 to the unnoised prefix
+  adaln        — flatten the n_cond context frames to a (n_cond*D,) vector; inject
+                 via AdaLN (summed into the timestep embedding before every block)
+  input_concat — same flattened vector concatenated channel-wise to every token
+                 before in_proj
 
-In both conditional modes --n_cond sets the number of conditioning frames N.
-The model's latent_len is set to N + H so it processes the full [cond|chunk]
-sequence.  latent_mean / latent_std in config.json are also (N+H, D).
+For inpaint / prepend the model's latent_len is N + H (full [cond|chunk] sequence).
+For adaln / input_concat the model's latent_len is H only; conditioning is model-
+internal.  norm_stats.npz (channel-wise, shape (D,)) is always computed over the
+full (N+H) window so rollout can normalise conditioning frames with the same stats.
 
 Reads:
   storage/data/vae/features/*.npz
   storage/data/vae/norm_stats.npz
 
 Writes:
-  storage/data/latents/<run_name>/model.pt
-  storage/data/latents/<run_name>/model_raw.pt
-  storage/data/latents/<run_name>/config.json   (model_type: "motion_dit_raw")
+  storage/runs/<run_name>/model.pt
+  storage/runs/<run_name>/model_raw.pt
+  storage/runs/<run_name>/config.json   (model_type: "motion_dit_raw")
 
 Usage:
   uv run python scripts/diffusion/train_raw_diffusion.py
@@ -33,6 +38,10 @@ Usage:
       --cond_mode inpaint --n_cond 10 --epochs 2000
   uv run python scripts/diffusion/train_raw_diffusion.py --run_name v2/rdiff_prepend \
       --cond_mode prepend --n_cond 10 --epochs 2000
+  uv run python scripts/diffusion/train_raw_diffusion.py --run_name v2/rdiff_adaln \
+      --cond_mode adaln --n_cond 10 --epochs 2000
+  uv run python scripts/diffusion/train_raw_diffusion.py --run_name v2/rdiff_input_concat \
+      --cond_mode input_concat --n_cond 10 --epochs 2000
 """
 
 from __future__ import annotations
@@ -46,7 +55,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from motion_latent.paths import FEAT_DIR, LATENTS_ROOT, STATS_PATH
+from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.diffusion.model import MotionDiT
 from motion_latent.diffusion.schedule import cosine_schedule
@@ -93,9 +102,10 @@ def train(args: argparse.Namespace) -> None:
     n_samples, seq_len, _ = all_seqs.shape
     print(f"sequences: {n_samples}  seq_len={seq_len}")
 
-    # Per-position standardisation across the full [cond|chunk] window.
-    state_mean = all_seqs.mean(axis=0)              # (seq_len, D)
-    state_std  = np.maximum(all_seqs.std(axis=0), 1e-4)
+    # Channel-wise normalisation across all samples and positions.
+    flat       = all_seqs.reshape(-1, D)
+    state_mean = flat.mean(axis=0)                  # (D,)
+    state_std  = np.maximum(flat.std(axis=0), 1e-4) # (D,)
     z_norm     = (all_seqs - state_mean) / state_std
     print(f"normalised: mean={z_norm.mean():.4f}  std={z_norm.std():.4f}")
 
@@ -103,21 +113,29 @@ def train(args: argparse.Namespace) -> None:
                         batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     # --- Schedule & model ---
-    # latent_len = N + H so the model processes the full [cond|chunk] sequence
+    # inpaint / prepend : model sees full [cond|chunk] sequence → latent_len = N + H
+    # adaln / input_concat : cond is injected internally → latent_len = H only
+    _MODEL_COND_MODES = {"adaln", "input_concat"}
+    cond_mode = args.cond_mode
+    model_latent_len = H if cond_mode in _MODEL_COND_MODES else seq_len
+    cond_dim         = N * D if cond_mode in _MODEL_COND_MODES else 0
+
     schedule = cosine_schedule(args.T)
     model    = MotionDiT(
-        latent_len=seq_len, latent_dim=D,
+        latent_len=model_latent_len, latent_dim=D,
         d_model=args.d_model, n_heads=args.n_heads,
         n_layers=args.n_layers, ff_mult=args.ff_mult,
+        cond_dim=cond_dim, cond_mode=cond_mode,
     ).to(device)
-    print(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"parameters: {sum(p.numel() for p in model.parameters()):,}  "
+          f"cond_mode={cond_mode}  cond_dim={cond_dim}")
 
     opt       = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     ema       = EMA(model, args.ema_decay)
     ab        = schedule.alphas_bar.to(device)
 
-    out_dir = LATENTS_ROOT / args.run_name
+    out_dir = RUNS_ROOT / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
@@ -129,14 +147,14 @@ def train(args: argparse.Namespace) -> None:
             t   = torch.randint(1, args.T + 1, (B,), device=device)
             ab_t = ab[t].view(B, 1, 1)
 
-            if args.cond_mode == "none":
+            if cond_mode == "none":
                 # --- unconditional ---
                 eps     = torch.randn_like(z0)
                 z_t     = ab_t.sqrt() * z0 + (1 - ab_t).sqrt() * eps
                 eps_hat = model(z_t, t)
                 loss    = F.mse_loss(eps_hat, eps)
 
-            elif args.cond_mode == "inpaint":
+            elif cond_mode == "inpaint":
                 # --- replacement inpainting ---
                 # Noise the full sequence, then independently re-noise the cond
                 # prefix so it's consistent with the replacement operation at
@@ -150,17 +168,28 @@ def train(args: argparse.Namespace) -> None:
                 eps_hat  = model(z_t, t)
                 loss     = F.mse_loss(eps_hat[:, N:], eps[:, N:])        # loss on [N:] only
 
-            elif args.cond_mode == "prepend":
+            elif cond_mode == "prepend":
                 # --- clean prefix prepended ---
                 # The conditioning tokens [0:N] are always passed clean;
                 # only the generative tokens [N:] are noised.
-                cond  = z0[:, :N]                                        # (B, N, D) clean
-                chunk = z0[:, N:]                                        # (B, H, D)
-                eps   = torch.randn_like(chunk)
-                z_t_chunk = ab_t.sqrt() * chunk + (1 - ab_t).sqrt() * eps
-                z_in      = torch.cat([cond, z_t_chunk], dim=1)          # (B, N+H, D)
-                eps_hat   = model(z_in, t)
-                loss      = F.mse_loss(eps_hat[:, N:], eps)              # loss on [N:] only
+                cond_frames = z0[:, :N]                                  # (B, N, D) clean
+                chunk       = z0[:, N:]                                  # (B, H, D)
+                eps         = torch.randn_like(chunk)
+                z_t_chunk   = ab_t.sqrt() * chunk + (1 - ab_t).sqrt() * eps
+                z_in        = torch.cat([cond_frames, z_t_chunk], dim=1) # (B, N+H, D)
+                eps_hat     = model(z_in, t)
+                loss        = F.mse_loss(eps_hat[:, N:], eps)            # loss on [N:] only
+
+            elif cond_mode in _MODEL_COND_MODES:
+                # --- adaln / input_concat ---
+                # Only the H generative frames are denoised; the N context frames
+                # are flattened to a vector and injected into the model internals.
+                chunk  = z0[:, N:]                                       # (B, H, D)
+                cond_v = z0[:, :N].reshape(B, -1)                       # (B, N*D)
+                eps    = torch.randn_like(chunk)
+                z_t    = ab_t.sqrt() * chunk + (1 - ab_t).sqrt() * eps
+                eps_hat = model(z_t, t, cond=cond_v)
+                loss    = F.mse_loss(eps_hat, eps)
 
             opt.zero_grad(); loss.backward(); opt.step()
             ema.update(model)
@@ -173,16 +202,16 @@ def train(args: argparse.Namespace) -> None:
 
     torch.save(ema.shadow,         out_dir / "model.pt")
     torch.save(model.state_dict(), out_dir / "model_raw.pt")
+    np.savez(out_dir / "norm_stats.npz", mean=state_mean, std=state_std)
 
     cfg = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     cfg.update({
-        "model_type":  "motion_dit_raw",
-        "latent_len":  seq_len,   # N + H — full sequence length the model processes
-        "H":           H,         # generative frames
-        "n_cond":      N,         # conditioning frames
-        "latent_dim":  D,
-        "latent_mean": state_mean.tolist(),   # (seq_len, D) — includes cond positions
-        "latent_std":  state_std.tolist(),
+        "model_type": "motion_dit_raw",
+        "latent_len": model_latent_len,
+        "H":          H,
+        "n_cond":     N,
+        "cond_dim":   cond_dim,
+        "latent_dim": D,
     })
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"saved → {out_dir}")
@@ -197,8 +226,8 @@ def main() -> None:
     ap.add_argument("--n_cond",     type=int,   default=0,
                     help="Number of conditioning frames prepended (0 = unconditional).")
     ap.add_argument("--cond_mode",  type=str,   default="none",
-                    choices=["none", "inpaint", "prepend"],
-                    help="Conditioning mechanism: none | inpaint | prepend.")
+                    choices=["none", "inpaint", "prepend", "adaln", "input_concat"],
+                    help="Conditioning mechanism.")
     ap.add_argument("--T",          type=int,   default=1000)
     ap.add_argument("--d_model",    type=int,   default=256)
     ap.add_argument("--n_heads",    type=int,   default=4)
@@ -214,7 +243,7 @@ def main() -> None:
     if args.cond_mode != "none" and args.n_cond == 0:
         ap.error(f"--cond_mode {args.cond_mode} requires --n_cond > 0")
     if args.cond_mode == "none" and args.n_cond > 0:
-        ap.error("--n_cond > 0 requires --cond_mode inpaint or prepend")
+        ap.error("--n_cond > 0 requires a conditional --cond_mode")
 
     train(args)
 

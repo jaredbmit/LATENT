@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.manifold import TSNE
 
-from motion_latent.paths import LATENTS_ROOT
+from motion_latent.paths import RUNS_ROOT
 
 # Canonical 64-D layout: [gvec(3), gyro(3), joint_pos(29), joint_vel(29)]
 IDX_GVEC_Z    = 2
@@ -68,7 +68,7 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
 
-    dataset_path = LATENTS_ROOT / args.vae_run / "chunk_diffusion_dataset.npz"
+    dataset_path = RUNS_ROOT / args.vae_run / "chunk_diffusion_dataset.npz"
     print(f"Loading {dataset_path}…")
     d          = np.load(dataset_path)
     latents    = d["latents"]        # (N, latent_len, latent_dim)

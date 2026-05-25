@@ -47,7 +47,7 @@ from motion_latent.diffusion.sampler import ddim_sample
 from motion_latent.diffusion.schedule import cosine_schedule
 from motion_latent.features import canonical_to_qpos
 from motion_latent.obs import GYRO_SCALE, JOINT_VEL_SCALE
-from motion_latent.paths import G1_XML, LATENTS_ROOT, META_PATH, STATS_PATH
+from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
 
 
 _RAW_TYPES = {"motion_dit_raw"}
@@ -96,7 +96,7 @@ def _generate_chunk(diff_run: str, vae_run_override: str,
     """
     from motion_latent.diffusion.sampler import ddim_inpaint_sample, ddim_prepend_sample
 
-    dit, cfg = MotionDiT.from_run(LATENTS_ROOT / diff_run, device)
+    dit, cfg = MotionDiT.from_run(RUNS_ROOT / diff_run, device)
     model_type = cfg.get("model_type", "motion_dit")
     n_cond     = cfg.get("n_cond", 0)
     cond_mode  = cfg.get("cond_mode", "none")
@@ -104,21 +104,19 @@ def _generate_chunk(diff_run: str, vae_run_override: str,
 
     schedule = cosine_schedule(cfg["T"])
 
-    lat_mean = torch.tensor(np.array(cfg["latent_mean"], dtype=np.float32), device=device)
-    lat_std  = torch.tensor(np.maximum(np.array(cfg["latent_std"], dtype=np.float32), 1e-4),
-                            device=device)
+    ns       = np.load(RUNS_ROOT / diff_run / "norm_stats.npz")
+    lat_mean = torch.tensor(ns["mean"].astype(np.float32), device=device)  # (D,)
+    lat_std  = torch.tensor(ns["std"].astype(np.float32),  device=device)  # (D,)
 
     stats     = np.load(STATS_PATH)
     mean, std = stats["mean"], stats["std"]
 
     if model_type in _RAW_TYPES:
         if n_cond > 0 and cond_canonical is not None:
-            # Normalise conditioning frames with the per-position cond stats
-            cond_mean = lat_mean[:n_cond]   # (N, D)
-            cond_std  = lat_std[:n_cond]
+            # Normalise conditioning frames: clip-space → model-normalised (channel-wise).
             cond_norm_np = (torch.from_numpy(
                 (cond_canonical - mean) / std   # canonical → clip-normalised
-            ).float().to(device) - cond_mean) / cond_std   # clip-normalised → model-normalised
+            ).float().to(device) - lat_mean) / lat_std    # clip-normalised → model-normalised
             cond_z0 = cond_norm_np.unsqueeze(0)  # (1, N, D)
         else:
             cond_z0 = None
@@ -143,7 +141,7 @@ def _generate_chunk(diff_run: str, vae_run_override: str,
     z_norm   = ddim_sample(dit, schedule, 1, device, steps=ddim_steps)
     z_unnorm = z_norm * lat_std + lat_mean
     vae_run  = vae_run_override or cfg.get("vae_run", "v2/cvae_base")
-    vae, _   = ChunkVAE.from_run(LATENTS_ROOT / vae_run, device)
+    vae, _   = ChunkVAE.from_run(RUNS_ROOT / vae_run, device)
     with torch.no_grad():
         chunk_norm = vae.decode(z_unnorm)[0].cpu().numpy()
     return chunk_norm * std + mean

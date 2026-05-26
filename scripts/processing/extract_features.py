@@ -1,14 +1,13 @@
 """Extract canonical state features from raw Tennis motion-capture .npz files.
 
-Per-frame feature vector (D=67). Channels [0:64] match the tracker canonical
-obs; channels [64:67] are root-trajectory features (yaw-invariant) so the
-diffusion model can supervise and reconstruct global motion:
+Per-frame feature vector (D=38). Joint velocities are intentionally omitted:
+they are finite differences of joint_pos and can be recovered downstream by
+differencing the joint-angle sequence.
   [0:3]   gvec_pelvis  — gravity direction in pelvis frame (unit vector)
   [3:6]   gyro_pelvis  — angular velocity in pelvis frame × 0.05
   [6:35]  joint_pos    — joint angles minus default_qpos[7:]
-  [35:64] joint_vel    — joint velocities (finite-diff) × 0.05
-  [64:65] root_height  — base z position (m); yaw-invariant
-  [65:67] root_vel_xy  — planar linear velocity in the heading (yaw-only) frame
+  [35:36] root_height  — base z position (m); yaw-invariant
+  [36:38] root_vel_xy  — planar linear velocity in the heading (yaw-only) frame
                          (m/s); yaw-invariant. Yaw rate itself is gyro_pelvis[z].
 
 Outputs written to storage/data/vae/:
@@ -31,7 +30,7 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from motion_latent.obs import GYRO_SCALE, JOINT_VEL_SCALE
+from motion_latent.obs import GYRO_SCALE
 from motion_latent.paths import G1_XML
 
 # ---------------------------------------------------------------------------
@@ -44,11 +43,10 @@ FEATURE_NAMES: list[str] = (
     [f"gvec_{a}"     for a in "xyz"]
     + [f"gyro_{a}"   for a in "xyz"]
     + [f"jpos_{i}"   for i in range(29)]
-    + [f"jvel_{i}"   for i in range(29)]
     + ["root_height"]
     + ["root_vel_x_heading", "root_vel_y_heading"]
 )
-D = len(FEATURE_NAMES)  # 67
+D = len(FEATURE_NAMES)  # 38
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +87,7 @@ def _heading_yaw(R: Rotation) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def extract_features(path: Path, default_qpos: np.ndarray, freq: float = 50.0) -> np.ndarray:
-    """Return (T, D=64) float32 canonical feature array for one motion file."""
+    """Return (T, D=38) float32 canonical feature array for one motion file."""
     d        = np.load(path, allow_pickle=True)
     qpos     = np.asarray(d["qpos"], dtype=np.float64)   # (T, 36)
     T        = qpos.shape[0]
@@ -110,13 +108,6 @@ def extract_features(path: Path, default_qpos: np.ndarray, freq: float = 50.0) -
     # joint_pos: angles relative to default pose (matches tracker joint_pos obs)
     joint_pos = (joint_ang - default_qpos).astype(np.float32)         # (T, 29)
 
-    # joint_vel: finite-diff velocities × scale (matches tracker obs_scales)
-    joint_ang_unwrapped = np.unwrap(joint_ang, axis=0)
-    jvel_raw            = np.empty_like(joint_ang)
-    jvel_raw[:-1]       = (joint_ang_unwrapped[1:] - joint_ang_unwrapped[:-1]) * freq
-    jvel_raw[-1]        = jvel_raw[-2]
-    joint_vel           = (jvel_raw * JOINT_VEL_SCALE).astype(np.float32)  # (T, 29)
-
     # root_height: base z (yaw-invariant)
     root_height = qpos[:, 2:3].astype(np.float32)                          # (T, 1)
 
@@ -133,7 +124,7 @@ def extract_features(path: Path, default_qpos: np.ndarray, freq: float = 50.0) -
     root_vel_h = np.stack([vx_h, vy_h], axis=1).astype(np.float32)         # (T, 2)
 
     feats = np.concatenate(
-        [gvec, gyro, joint_pos, joint_vel, root_height, root_vel_h], axis=1
+        [gvec, gyro, joint_pos, root_height, root_vel_h], axis=1
     )
     assert feats.shape == (T, D), f"Shape mismatch: expected ({T},{D}), got {feats.shape}"
     return feats
@@ -196,7 +187,6 @@ def main() -> None:
         "D": D,
         "freq": args.freq,
         "gyro_scale": GYRO_SCALE,
-        "joint_vel_scale": JOINT_VEL_SCALE,
         "total_frames": total_frames,
         "sources": [str(p) for p in raw_files],
     }
@@ -209,9 +199,8 @@ def main() -> None:
         ("gvec",        0,  3),
         ("gyro",        3,  6),
         ("joint_pos",   6, 35),
-        ("joint_vel",  35, 64),
-        ("root_height",64, 65),
-        ("root_vel_xy",65, 67),
+        ("root_height",35, 36),
+        ("root_vel_xy",36, 38),
     ]
     for name, a, b in groups:
         blk = all_feats[:, a:b]

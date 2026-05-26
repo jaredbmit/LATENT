@@ -4,12 +4,14 @@ Column layout (post-normalisation):
   [0:3]   gvec_pelvis  — gravity direction in pelvis frame (unit vector)
   [3:6]   gyro_pelvis  — angular velocity in pelvis frame × 0.05
   [6:35]  joint_pos    — joint angles minus default_qpos[7:]
-  [35:64] joint_vel    — joint velocities × 0.05
-  [64]    root_height  — base z position (m)            [only when D >= 67]
-  [65:67] root_vel_xy  — planar velocity, heading frame [only when D >= 67]
+  [35]    root_height  — base z position (m)            [only when D >= 38]
+  [36:38] root_vel_xy  — planar velocity, heading frame [only when D >= 38]
 
-For the legacy 64-D layout the root trajectory is not encoded, so
-canonical_to_qpos fixes root Z at 0.8 m and XY at 0. For the 67-D layout the
+Joint velocities are not encoded: they are finite differences of joint_pos and
+are recovered downstream by differencing the joint-angle sequence.
+
+For a joints-only layout the root trajectory is not encoded, so
+canonical_to_qpos fixes root Z at 0.8 m and XY at 0. For the 38-D layout the
 height channel sets Z and the heading-frame velocity is integrated (with the
 yaw integrated from gyro_z) to recover a global XY trajectory.
 """
@@ -24,11 +26,10 @@ from motion_latent.obs import GYRO_SCALE
 IDX_GVEC        = slice(0, 3)
 IDX_GYRO        = slice(3, 6)
 IDX_JOINT_POS   = slice(6, 35)
-IDX_JOINT_VEL   = slice(35, 64)
-IDX_ROOT_HEIGHT = 64
-IDX_ROOT_VEL    = slice(65, 67)
+IDX_ROOT_HEIGHT = 35
+IDX_ROOT_VEL    = slice(36, 38)
 
-D_WITH_ROOT    = 67    # canonical width that includes root height + planar velocity
+D_WITH_ROOT    = 38    # canonical width that includes root height + planar velocity
 ROOT_Z_DEFAULT = 0.8   # fallback render height (m) when height channel is absent
 
 
@@ -41,12 +42,12 @@ def canonical_to_qpos(
     """Reconstruct (T, 36) MuJoCo qpos from (T, D) unnormalised canonical state.
 
     Yaw is integrated from gyro_z (after undoing the ×0.05 scaling). For the
-    67-D layout, root Z comes from the height channel and global XY is integrated
-    from the heading-frame planar velocity; for the legacy 64-D layout, root Z is
+    38-D layout, root Z comes from the height channel and global XY is integrated
+    from the heading-frame planar velocity; for a joints-only layout, root Z is
     fixed at ROOT_Z_DEFAULT and XY at 0.
 
     Args:
-        state:       (T, D) unnormalised canonical feature array (D = 64 or 67)
+        state:       (T, D) unnormalised canonical feature array (D = 36 or 38)
         default_qpos: (29,) default joint angles from G1 keyframe
         freq:        motion frequency in Hz
         yaw0:        initial yaw angle in radians

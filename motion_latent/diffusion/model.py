@@ -212,8 +212,8 @@ class MotionMLP(nn.Module):
     Supported cond_mode values: "none" | "inpaint" | "prepend" | "input_concat".
     "adaln" is not supported (no per-layer modulation pathway).
 
-    Note on scale: the flat input dimension is latent_len * latent_dim (e.g. 6400
-    for H=100, D=64), so in_proj and out_proj dominate the parameter count even at
+    Note on scale: the flat input dimension is latent_len * latent_dim (e.g. 3800
+    for H=100, D=38), so in_proj and out_proj dominate the parameter count even at
     modest d_hidden.  Use d_hidden ≥ 256 for reasonable expressiveness.
     """
 

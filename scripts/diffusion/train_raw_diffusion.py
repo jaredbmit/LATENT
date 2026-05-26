@@ -4,7 +4,7 @@ This is the raw-space counterpart to train_diffusion.py which operates in the
 ChunkVAE latent space. Both use the same MotionDiT architecture; the only
 difference is the input tensor:
   latent diffusion : latents from VAE encoder  (N, latent_len=25, latent_dim=16)
-  raw diffusion    : normalised motion chunks   (N, H=100,         D=64)
+  raw diffusion    : normalised motion chunks   (N, H=100,         D=38)
 
 Conditioning modes (--cond_mode):
   none         — unconditional generation (default, matches rdiff_base behaviour)
@@ -83,7 +83,7 @@ def geometric_losses(
       pos_feet  : MSE between predicted and target foot positions (pelvis-local).
       foot_slide: mean squared *world-frame* foot velocity over frames where the
                   *target* foot is planted (world foot height < foot_eps); zero if
-                  there are no contact frames in the batch. Requires D >= 67.
+                  there are no contact frames in the batch. Requires D >= 38.
     """
     # FK runs in fp32: pytorch_kinematics keeps its link transforms in fp32 and
     # errors under bf16 autocast. Gradients still flow back into the bf16 model.
@@ -211,8 +211,8 @@ def train(args: argparse.Namespace) -> None:
     want_slide = args.lambda_foot_slide > 0.0
     if use_geo and D < 35:
         raise ValueError(f"Geometric position losses need the joint-angle block (D>=35); got D={D}")
-    if want_slide and D < 67:
-        raise ValueError(f"Foot-sliding loss needs root height/velocity channels (D>=67); got D={D}")
+    if want_slide and D < 38:
+        raise ValueError(f"Foot-sliding loss needs root height/velocity channels (D>=38); got D={D}")
     fk       = G1Kinematics().to(device) if use_geo else None
     mean_t   = torch.tensor(state_mean, dtype=torch.float32, device=device)
     std_t    = torch.tensor(state_std,  dtype=torch.float32, device=device)
@@ -372,7 +372,7 @@ def main() -> None:
                     help="Weight on MSE between predicted/target foot FK positions.")
     ap.add_argument("--lambda_foot_slide", type=float, default=0.0,
                     help="Weight on world-frame foot-velocity penalty while the target foot "
-                         "is in contact. Requires D>=67 (root height/velocity channels).")
+                         "is in contact. Requires D>=38 (root height/velocity channels).")
     ap.add_argument("--foot_contact_eps", type=float, default=0.08,
                     help="World-frame foot height (m) below which a foot counts as planted "
                          "(standing ankle-site height is ~0.04 m).")

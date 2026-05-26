@@ -135,7 +135,7 @@ class G1Kinematics(nn.Module):
     def foot_world(self, feat: torch.Tensor, freq: float) -> dict[str, torch.Tensor]:
         """World-frame foot height and (drift-free) world foot velocity from a chunk.
 
-        feat: (B, H, D) **unnormalised** canonical features (D >= 67, see features.py).
+        feat: (B, H, D) **unnormalised** canonical features (D >= 38, see features.py).
         Returns:
             height: (B, H, 2) world z of each foot (left, right).
             vel:    (B, H-1, 2, 3) world foot velocity per inter-frame step.

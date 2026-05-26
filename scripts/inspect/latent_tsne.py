@@ -24,15 +24,15 @@ from sklearn.manifold import TSNE
 
 from motion_latent.paths import RUNS_ROOT
 
-# Canonical 64-D layout: [gvec(3), gyro(3), joint_pos(29), joint_vel(29)]
+# Canonical 38-D layout: [gvec(3), gyro(3), joint_pos(29), root_height(1), root_vel_xy(2)]
+# Joint velocity is no longer a feature; velocity-based metrics finite-diff joint_pos.
 IDX_GVEC_Z    = 2
 IDX_JOINT_POS = slice(6, 35)
-IDX_JOINT_VEL = slice(35, 64)
 
 
 def compute_color(
     name: str,
-    states: np.ndarray,    # (N, H, 64)
+    states: np.ndarray,    # (N, H, 38)
     clip_id: np.ndarray,   # (N,) int
     clip_names: np.ndarray,
 ) -> tuple[np.ndarray, str, bool]:
@@ -42,11 +42,13 @@ def compute_color(
     if name == "gvec_z":
         return states[:, :, IDX_GVEC_Z].mean(axis=1), "mean gvec_z (upright≈−1)", False
     if name == "joint_vel_mag":
-        return np.linalg.norm(states[:, :, IDX_JOINT_VEL], axis=(1, 2)), "joint vel magnitude", False
+        jvel = np.diff(states[:, :, IDX_JOINT_POS], axis=1)
+        return np.linalg.norm(jvel, axis=(1, 2)), "joint vel magnitude (finite-diff)", False
     if name == "joint_ang_spread":
         return states[:, :, IDX_JOINT_POS].std(axis=(1, 2)), "joint angle std", False
     if name == "motion_energy":
-        return (states[:, :, IDX_JOINT_VEL] ** 2).mean(axis=(1, 2)), "motion energy (mean sq vel)", False
+        jvel = np.diff(states[:, :, IDX_JOINT_POS], axis=1)
+        return (jvel ** 2).mean(axis=(1, 2)), "motion energy (mean sq finite-diff vel)", False
     raise ValueError(f"Unknown color: {name}")
 
 
@@ -72,7 +74,7 @@ def main() -> None:
     print(f"Loading {dataset_path}…")
     d          = np.load(dataset_path)
     latents    = d["latents"]        # (N, latent_len, latent_dim)
-    states     = d["states"]         # (N, H, 64)
+    states     = d["states"]         # (N, H, 38)
     clip_id    = d["clip_id"]        # (N,) int
     clip_names = d["clip_names"]     # (4,) str
 

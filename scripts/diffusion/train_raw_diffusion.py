@@ -58,6 +58,55 @@ from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.diffusion.model import MotionDiT, MotionMLP
 from motion_latent.diffusion.schedule import cosine_schedule
+from motion_latent.features import IDX_JOINT_POS
+from motion_latent.kinematics import G1Kinematics
+
+
+def geometric_losses(
+    fk: G1Kinematics,
+    pred_norm: torch.Tensor,
+    tgt_norm: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    foot_eps: float,
+    freq: float,
+    want_slide: bool,
+) -> dict[str, torch.Tensor]:
+    """FK-based geometric losses on the generative chunk (normalised in → losses).
+
+    Both inputs are (B, H, D) normalised feature chunks; they are unnormalised and
+    fed through differentiable FK (motion_latent.kinematics). Computed in whatever
+    dtype the caller is in (matches the training autocast).
+
+    Returns a dict of unweighted scalar losses:
+      pos_hands : MSE between predicted and target hand positions (pelvis-local).
+      pos_feet  : MSE between predicted and target foot positions (pelvis-local).
+      foot_slide: mean squared *world-frame* foot velocity over frames where the
+                  *target* foot is planted (world foot height < foot_eps); zero if
+                  there are no contact frames in the batch. Requires D >= 67.
+    """
+    # FK runs in fp32: pytorch_kinematics keeps its link transforms in fp32 and
+    # errors under bf16 autocast. Gradients still flow back into the bf16 model.
+    pred = pred_norm.float() * std + mean
+    tgt  = (tgt_norm.float() * std + mean).detach()
+
+    sp = fk(pred[..., IDX_JOINT_POS])                       # predicted pelvis-local sites
+    st = fk(tgt[..., IDX_JOINT_POS])                        # target sites (no grad)
+    pos_hands = F.mse_loss(sp["hands"], st["hands"])
+    pos_feet  = F.mse_loss(sp["feet"],  st["feet"])
+
+    out = {"pos_hands": pos_hands, "pos_feet": pos_feet}
+    if want_slide:
+        # World-frame foot kinematics: contact mask from the (detached) target
+        # height; velocity penalty on the predicted world foot velocity.
+        fw_pred = fk.foot_world(pred, freq)
+        fw_tgt  = fk.foot_world(tgt, freq)
+        contact = (fw_tgt["height"][:, :-1] < foot_eps).float()    # (B, H-1, 2)
+        vel_sq  = fw_pred["vel"].pow(2).sum(dim=-1)                 # (B, H-1, 2)
+        out["foot_slide"] = (contact * vel_sq).sum() / contact.sum().clamp_min(1.0)
+    else:
+        out["foot_slide"] = pred.new_zeros(())
+    return out
 
 
 class EMA:
@@ -76,6 +125,8 @@ class EMA:
 
 
 def train(args: argparse.Namespace) -> None:
+    torch.backends.cuda.matmul.fp32_precision   = 'tf32'  # enable TF32 on Ampere+
+    torch.backends.cudnn.conv.fp32_precision    = 'tf32'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}  cond_mode={args.cond_mode}  n_cond={args.n_cond}")
 
@@ -144,11 +195,29 @@ def train(args: argparse.Namespace) -> None:
         ).to(device)
     print(f"parameters: {sum(p.numel() for p in model.parameters()):,}  "
           f"backbone={backbone}  cond_mode={cond_mode}  cond_dim={cond_dim}")
+    # model = torch.compile(model)
 
     opt       = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     ema       = EMA(model, args.ema_decay)
     ab        = schedule.alphas_bar.to(device)
+
+    # Geometric (FK) losses operate in unnormalised feature space, so they need
+    # the channel-wise norm stats and a differentiable G1 FK module.
+    lambdas  = {"pos_hands": args.lambda_pos_hands,
+                "pos_feet":  args.lambda_pos_feet,
+                "foot_slide": args.lambda_foot_slide}
+    use_geo  = max(lambdas.values()) > 0.0
+    want_slide = args.lambda_foot_slide > 0.0
+    if use_geo and D < 35:
+        raise ValueError(f"Geometric position losses need the joint-angle block (D>=35); got D={D}")
+    if want_slide and D < 67:
+        raise ValueError(f"Foot-sliding loss needs root height/velocity channels (D>=67); got D={D}")
+    fk       = G1Kinematics().to(device) if use_geo else None
+    mean_t   = torch.tensor(state_mean, dtype=torch.float32, device=device)
+    std_t    = torch.tensor(state_std,  dtype=torch.float32, device=device)
+    print(f"geometric losses: {'on' if use_geo else 'off'}  lambdas={lambdas}  "
+          f"foot_contact_eps={args.foot_contact_eps}  freq={args.freq}")
 
     out_dir = RUNS_ROOT / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -156,6 +225,7 @@ def train(args: argparse.Namespace) -> None:
     import time
     t0 = time.perf_counter()
     steps_since_log = 0
+    geo_sums = {"pos_hands": 0.0, "pos_feet": 0.0, "foot_slide": 0.0}
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -167,12 +237,16 @@ def train(args: argparse.Namespace) -> None:
             t   = torch.randint(1, args.T + 1, (B,), device=device)
             ab_t = ab[t].view(B, 1, 1)
 
+            # The model predicts the clean sample x0; loss is MSE(x0_hat, target)
+            # on the generative positions only.
             if cond_mode == "none":
                 # --- unconditional ---
-                eps     = torch.randn_like(z0)
-                z_t     = ab_t.sqrt() * z0 + (1 - ab_t).sqrt() * eps
-                eps_hat = model(z_t, t)
-                loss    = F.mse_loss(eps_hat, eps)
+                eps  = torch.randn_like(z0)
+                z_t  = ab_t.sqrt() * z0 + (1 - ab_t).sqrt() * eps
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    x0_hat = model(z_t, t)
+                    loss   = F.mse_loss(x0_hat, z0)
+                pred_chunk, tgt_chunk = x0_hat, z0
 
             elif cond_mode == "inpaint":
                 # --- replacement inpainting ---
@@ -181,12 +255,12 @@ def train(args: argparse.Namespace) -> None:
                 # inference (ddim_inpaint_sample).
                 eps      = torch.randn_like(z0)                          # (B, N+H, D)
                 z_t      = ab_t.sqrt() * z0 + (1 - ab_t).sqrt() * eps
-
                 eps_cond = torch.randn(B, N, D, device=device)
                 z_t[:, :N] = ab_t.sqrt() * z0[:, :N] + (1 - ab_t).sqrt() * eps_cond
-
-                eps_hat  = model(z_t, t)
-                loss     = F.mse_loss(eps_hat[:, N:], eps[:, N:])        # loss on [N:] only
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    x0_hat = model(z_t, t)
+                    loss   = F.mse_loss(x0_hat[:, N:], z0[:, N:])        # loss on [N:] only
+                pred_chunk, tgt_chunk = x0_hat[:, N:], z0[:, N:]
 
             elif cond_mode == "prepend":
                 # --- clean prefix prepended ---
@@ -197,8 +271,10 @@ def train(args: argparse.Namespace) -> None:
                 eps         = torch.randn_like(chunk)
                 z_t_chunk   = ab_t.sqrt() * chunk + (1 - ab_t).sqrt() * eps
                 z_in        = torch.cat([cond_frames, z_t_chunk], dim=1) # (B, N+H, D)
-                eps_hat     = model(z_in, t)
-                loss        = F.mse_loss(eps_hat[:, N:], eps)            # loss on [N:] only
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    x0_hat = model(z_in, t)
+                    loss   = F.mse_loss(x0_hat[:, N:], chunk)            # loss on [N:] only
+                pred_chunk, tgt_chunk = x0_hat[:, N:], chunk
 
             elif cond_mode in _MODEL_COND_MODES:
                 # --- adaln / input_concat ---
@@ -208,8 +284,23 @@ def train(args: argparse.Namespace) -> None:
                 cond_v = z0[:, :N].reshape(B, -1)                       # (B, N*D)
                 eps    = torch.randn_like(chunk)
                 z_t    = ab_t.sqrt() * chunk + (1 - ab_t).sqrt() * eps
-                eps_hat = model(z_t, t, cond=cond_v)
-                loss    = F.mse_loss(eps_hat, eps)
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    x0_hat = model(z_t, t, cond=cond_v)
+                    loss   = F.mse_loss(x0_hat, chunk)
+                pred_chunk, tgt_chunk = x0_hat, chunk
+
+            # --- geometric (FK) auxiliary losses (fp32; see geometric_losses) ---
+            if use_geo:
+                with torch.autocast('cuda', enabled=False):
+                    geo = geometric_losses(fk, pred_chunk.float(), tgt_chunk.float(),
+                                           mean_t, std_t, args.foot_contact_eps,
+                                           args.freq, want_slide)
+                    geo_loss = (lambdas["pos_hands"]  * geo["pos_hands"]
+                                + lambdas["pos_feet"]  * geo["pos_feet"]
+                                + lambdas["foot_slide"] * geo["foot_slide"])
+                loss = loss + geo_loss
+                for k, v in geo.items():
+                    geo_sums[k] += v.item()
 
             opt.zero_grad(); loss.backward(); opt.step()
             ema.update(model)
@@ -220,8 +311,14 @@ def train(args: argparse.Namespace) -> None:
         if epoch % args.log_every == 0:
             elapsed = time.perf_counter() - t0
             ms_per_step = 1000 * elapsed / steps_since_log
-            print(f"epoch {epoch:5d}  lr={scheduler.get_last_lr()[0]:.2e}  "
-                  f"loss={loss_sum/n_batches:.5f}  {ms_per_step:.1f}ms/step")
+            msg = (f"epoch {epoch:5d}  lr={scheduler.get_last_lr()[0]:.2e}  "
+                   f"loss={loss_sum/n_batches:.5f}")
+            if use_geo:
+                steps = n_batches * args.log_every
+                msg += ("  " + "  ".join(f"{k}={geo_sums[k]/steps:.5f}" for k in geo_sums))
+                for k in geo_sums:
+                    geo_sums[k] = 0.0
+            print(f"{msg}  {ms_per_step:.1f}ms/step")
             t0 = time.perf_counter()
             steps_since_log = 0
 
@@ -268,6 +365,19 @@ def main() -> None:
     ap.add_argument("--lr",         type=float, default=1e-4)
     ap.add_argument("--ema_decay",  type=float, default=0.999)
     ap.add_argument("--log_every",  type=int,   default=100)
+    # --- geometric (FK) auxiliary losses ---
+    ap.add_argument("--lambda_pos_hands", type=float, default=0.0,
+                    help="Weight on MSE between predicted/target hand FK positions.")
+    ap.add_argument("--lambda_pos_feet",  type=float, default=0.0,
+                    help="Weight on MSE between predicted/target foot FK positions.")
+    ap.add_argument("--lambda_foot_slide", type=float, default=0.0,
+                    help="Weight on world-frame foot-velocity penalty while the target foot "
+                         "is in contact. Requires D>=67 (root height/velocity channels).")
+    ap.add_argument("--foot_contact_eps", type=float, default=0.08,
+                    help="World-frame foot height (m) below which a foot counts as planted "
+                         "(standing ankle-site height is ~0.04 m).")
+    ap.add_argument("--freq", type=float, default=50.0,
+                    help="Motion frame rate (Hz); used to scale foot velocity in the slide loss.")
     args = ap.parse_args()
 
     if args.cond_mode != "none" and args.n_cond == 0:

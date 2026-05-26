@@ -92,10 +92,10 @@ The motion tracker training pipeline is based on [OpenTrack](https://github.com/
 
   ```shell
   # Use `num_batches` to split data into multiple batches for parallel processing on multiple GPUs. You should manually launch multiple processes on different GPUs for parallel processing.
-  python scripts/process_motion/preprocess_motion.py --task G1TrackingGeneral --num_batches XXX --smooth_start_end False
+  python scripts/processing/preprocess_motion.py --task G1TrackingGeneral --num_batches XXX --smooth_start_end False
   
   # Or run on a single GPU without parallelism
-  python scripts/process_motion/preprocess_motion.py --task G1TrackingGeneral --num_batches 1 --smooth_start_end False
+  python scripts/processing/preprocess_motion.py --task G1TrackingGeneral --num_batches 1 --smooth_start_end False
   ```
   
   Argument `--smooth_start_end True` can generate a natural transition motion from the default pose before the original motion.

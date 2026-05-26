@@ -3,10 +3,14 @@
 All metrics are computed in normalised feature space; real chunks come from the
 encoded dataset. The script auto-detects from config.json whether a run is a
 latent diffusion model (needs ChunkVAE decode) or a raw diffusion model (outputs
-features directly).
+features directly), and whether it is conditional or unconditional.
 
-  model_type "motion_dit" / "motion_dit_latent" → latent diffusion
-  model_type "motion_dit_raw"                   → raw diffusion (no VAE decode)
+  model_type "motion_dit" / "motion_dit_latent" → latent diffusion (unconditional)
+  model_type "motion_dit_raw" / "motion_mlp_raw" → raw diffusion (any cond_mode)
+
+For conditional raw models (cond_mode != "none") the eval conditions each sample
+on the corresponding real frame(s) drawn from the dataset — this measures the
+marginal quality of the conditional distribution, not autoregressive rollout.
 
 Metrics (lower is better unless noted):
   fid        Frechet distance between per-frame feature distributions vs. real
@@ -18,15 +22,14 @@ Metrics (lower is better unless noted):
              ratio nn_dist/train_nn >> 1 means novel, ~1 means memorised
 
 Usage:
-  uv run python scripts/diffusion/eval_diffusion.py --diff_run diff_base
-  uv run python scripts/diffusion/eval_diffusion.py --diff_run rdiff_base
+  uv run python scripts/diffusion/eval_diffusion.py --diff_run v3/rdiff_base
+  uv run python scripts/diffusion/eval_diffusion.py --diff_run v3/rmlp_1step
   uv run python scripts/diffusion/eval_diffusion.py --diff_run diff_deep --n 512
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 
 import numpy as np
 import torch
@@ -36,12 +39,11 @@ from motion_latent.paths import FEAT_DIR, RUNS_ROOT, STATS_PATH
 from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.chunk_vae.model import ChunkVAE
 from motion_latent.diffusion.model import load_model
-from motion_latent.diffusion.sampler import ddim_sample
+from motion_latent.diffusion.rollout import decode_chunks, sample_chunks
 from motion_latent.diffusion.schedule import cosine_schedule
 
 
-_LATENT_TYPES = {"motion_dit", "motion_dit_latent"}
-_RAW_TYPES    = {"motion_dit_raw", "motion_mlp_raw"}
+_RAW_TYPES = {"motion_dit_raw", "motion_mlp_raw"}
 
 
 def frechet_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -90,34 +92,19 @@ def report(name: str, chunks: np.ndarray, real: np.ndarray, flat_real: np.ndarra
           f"mean_err={mean_err:.4f}  std_err={std_err:.4f}  nn_dist={mem:.4f}")
 
 
-def _load_norm_stats(run_name: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    stats = np.load(RUNS_ROOT / run_name / "norm_stats.npz")
-    mean  = torch.tensor(stats["mean"].astype(np.float32), device=device)
-    std   = torch.tensor(stats["std"].astype(np.float32),  device=device)
-    return mean, std
+def _load_cond_z_norm(
+    conds_feat: np.ndarray,
+    diff_run: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Normalise feature-space conditioning frames into diffusion model space.
 
-
-def sample_diffusion(dit: MotionDiT, cfg: dict, n: int, device: torch.device,
-                     ddim_steps: int) -> np.ndarray:
-    """Draw n chunks in normalised feature space, routing by model_type."""
-    schedule = cosine_schedule(cfg["T"])
-    z_norm   = ddim_sample(dit, schedule, n, device, steps=ddim_steps)
-
-    mean, std = _load_norm_stats(cfg["run_name"], device)
-    z_unnorm  = z_norm * std + mean   # (n, latent_len, latent_dim)
-
-    model_type = cfg.get("model_type", "motion_dit")
-    if model_type in _RAW_TYPES:
-        n_cond = cfg.get("n_cond", 0)
-        return z_unnorm[:, n_cond:].cpu().numpy()   # (n, H, D) generative frames only
-
-    # Latent: decode through ChunkVAE
-    vae_run = cfg.get("vae_run")
-    if not vae_run:
-        raise ValueError("config.json missing 'vae_run' for latent diffusion model.")
-    vae, _ = ChunkVAE.from_run(RUNS_ROOT / vae_run, device)
-    with torch.no_grad():
-        return vae.decode(z_unnorm).cpu().numpy()    # (n, H, D)
+    conds_feat: (n, n_cond, D) singly-normalised (STATS_PATH) conditioning frames.
+    Returns: (n, n_cond, D) doubly-normalised tensor on device.
+    """
+    ns    = np.load(RUNS_ROOT / diff_run / "norm_stats.npz")
+    z     = (conds_feat - ns["mean"]) / ns["std"]
+    return torch.from_numpy(z.astype(np.float32)).to(device)
 
 
 def main() -> None:
@@ -139,45 +126,63 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    dit, dit_cfg = load_model(RUNS_ROOT / args.diff_run, device)
-    model_type   = dit_cfg.get("model_type", "motion_dit")
-    vae_run      = args.vae_run or dit_cfg.get("vae_run")
+    model, cfg   = load_model(RUNS_ROOT / args.diff_run, device)
+    model_type   = cfg.get("model_type", "motion_dit")
+    cond_mode    = cfg.get("cond_mode", "none")
+    n_cond       = cfg.get("n_cond", 0)
+    vae_run      = args.vae_run or cfg.get("vae_run")
     is_raw       = model_type in _RAW_TYPES
-    print(f"diff_run={args.diff_run}  model_type={model_type}  vae_run={vae_run or '(none)'}")
+    print(f"diff_run={args.diff_run}  model_type={model_type}  "
+          f"cond_mode={cond_mode}  vae_run={vae_run or '(none)'}")
 
-    # Real chunks: from feature files for raw models, from VAE dataset for latent models.
+    # ---------------------------------------------------------- load real data
     if is_raw:
-        H       = dit_cfg.get("H", args.H)   # generative frames only (not n_cond+H)
-        dataset = MotionChunkDataset(FEAT_DIR, STATS_PATH, H=H)
+        H       = cfg.get("H", args.H)
+        dataset = MotionChunkDataset(FEAT_DIR, STATS_PATH, H=H, n_cond=max(n_cond, 1))
         real    = np.stack([dataset[i][0].numpy() for i in range(len(dataset))])  # (M, H, D)
+        conds   = np.stack([dataset[i][1].numpy() for i in range(len(dataset))])  # (M, nc, D)
+        conds   = conds[:, -n_cond:] if n_cond > 0 else None                      # (M, n_cond, D)
     else:
         if vae_run is None:
             raise ValueError("vae_run not found in config and --vae_run not specified.")
         data  = np.load(RUNS_ROOT / vae_run / "chunk_diffusion_dataset.npz")
         real  = data["states"].astype(np.float32)   # (M, H, D)
+        conds = None
 
-    n = real.shape[0] if args.n == 0 else min(args.n, real.shape[0])
-    real_sub = real if n == real.shape[0] else real[np.random.choice(real.shape[0], n, replace=False)]
+    n        = real.shape[0] if args.n == 0 else min(args.n, real.shape[0])
+    idx      = (np.arange(n) if n == real.shape[0]
+                else np.random.choice(real.shape[0], n, replace=False))
+    real_sub = real[idx]
     flat_real = real.reshape(real.shape[0], -1).astype(np.float32)
 
-    with torch.no_grad():
-        diff = sample_diffusion(dit, dit_cfg, n, device, args.ddim_steps)
+    # ---------------------------------------------------------- sample diffusion
+    schedule    = cosine_schedule(cfg["T"])
+    cond_z_norm = (_load_cond_z_norm(conds[idx], args.diff_run, device)
+                   if conds is not None else None)
 
+    with torch.no_grad():
+        z_full = sample_chunks(model, cfg, schedule, n, device, args.ddim_steps,
+                               cond_z_norm=cond_z_norm)
+        diff   = decode_chunks(z_full, cfg, device)   # (n, H, D)
+
+        # Gaussian baseline: only meaningful for latent models with a VAE
         gauss = None
         if vae_run is not None:
-            mean, std = _load_norm_stats(vae_run, device)
+            ns        = np.load(RUNS_ROOT / vae_run / "norm_stats.npz")
+            mean_t    = torch.tensor(ns["mean"].astype(np.float32), device=device)
+            std_t     = torch.tensor(ns["std"].astype(np.float32),  device=device)
             vae, _    = ChunkVAE.from_run(RUNS_ROOT / vae_run, device)
-            zg        = vae.sample(n, device) * std + mean
+            zg        = vae.sample(n, device) * std_t + mean_t
             gauss     = vae.decode(zg).cpu().numpy()
 
-    # Within-training NN baseline: first half → second half (disjoint).
+    # ---------------------------------------------------------- metrics
     half     = real.shape[0] // 2
     train_nn = nn_dist(flat_real[:half], flat_real[half:])
     print(f"n={n}  ddim_steps={args.ddim_steps}\n")
 
     if gauss is not None:
-        report("gaussian",  gauss,    real_sub, flat_real)
-    report("diffusion",     diff,     real_sub, flat_real)
+        report("gaussian",  gauss, real_sub, flat_real)
+    report("diffusion", diff, real_sub, flat_real)
     print(f"\n  {'train_nn':<12} (within-training baseline)  nn_dist={train_nn:.4f}")
 
 

@@ -8,10 +8,16 @@ from .model import MotionDiT
 from .schedule import Schedule
 
 
-def _ddim_step(z: torch.Tensor, eps_hat: torch.Tensor,
+def _ddim_step(z: torch.Tensor, z0_hat: torch.Tensor,
                ab_now: torch.Tensor, ab_next: torch.Tensor) -> torch.Tensor:
-    """Single DDIM update step (deterministic, η=0)."""
-    z0_hat = ((z - (1 - ab_now).sqrt() * eps_hat) / ab_now.sqrt().clamp(min=1e-8)).clamp(-10, 10)
+    """Single DDIM update step (deterministic, η=0).
+
+    The model predicts x0 directly. We recover eps from (z, x0_hat) by dividing
+    by sqrt(1 - ab_now) — stable at high noise (≈1) — instead of the eps-prediction
+    form that divides by sqrt(ab_now) (≈0 at high noise).
+    """
+    z0_hat  = z0_hat.clamp(-10, 10)
+    eps_hat = (z - ab_now.sqrt() * z0_hat) / (1 - ab_now).sqrt().clamp(min=1e-8)
     return ab_next.sqrt() * z0_hat + (1 - ab_next).sqrt() * eps_hat
 
 
@@ -44,8 +50,8 @@ def ddim_sample(
     z = torch.randn(n, model.latent_len, model.latent_dim, device=device)
     for i in range(steps):
         ab_now, ab_next = ab[indices[i]], ab[indices[i + 1]]
-        eps_hat = model(z, indices[i].expand(n).to(device), cond=cond)
-        z = _ddim_step(z, eps_hat, ab_now, ab_next)
+        x0_hat = model(z, indices[i].expand(n).to(device), cond=cond)
+        z = _ddim_step(z, x0_hat, ab_now, ab_next)
     return z
 
 
@@ -99,8 +105,8 @@ def ddim_inpaint_sample(
         z_known_noisy = ab_now.sqrt() * known_z0 + (1 - ab_now).sqrt() * eps_k
         z[:, known_mask] = z_known_noisy[:, known_mask]
 
-        eps_hat = model(z, t_now.expand(n).to(device), cond=cond)
-        z = _ddim_step(z, eps_hat, ab_now, ab_next)
+        x0_hat = model(z, t_now.expand(n).to(device), cond=cond)
+        z = _ddim_step(z, x0_hat, ab_now, ab_next)
 
     # Final hard replacement: ensure known positions are exactly the clean values.
     z[:, known_mask] = known_z0[:, known_mask]
@@ -148,7 +154,7 @@ def ddim_prepend_sample(
         ab_now, ab_next  = ab[t_now], ab[t_next]
 
         z_in    = torch.cat([cond_z0, z], dim=1)                           # (n, n_cond+H, d)
-        eps_hat = model(z_in, t_now.expand(n).to(device))[:, n_cond:]      # (n, H, d)
-        z       = _ddim_step(z, eps_hat, ab_now, ab_next)
+        x0_hat  = model(z_in, t_now.expand(n).to(device))[:, n_cond:]      # (n, H, d)
+        z       = _ddim_step(z, x0_hat, ab_now, ab_next)
 
     return torch.cat([cond_z0, z], dim=1)   # (n, n_cond+H, d)

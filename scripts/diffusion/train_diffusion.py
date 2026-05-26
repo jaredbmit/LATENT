@@ -20,10 +20,11 @@ import argparse
 import json
 from pathlib import Path
 
+import time
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 from motion_latent.paths import RUNS_ROOT
 from motion_latent.diffusion.model import MotionDiT
@@ -52,6 +53,8 @@ class EMA:
 
 
 def train(args: argparse.Namespace) -> None:
+    torch.backends.cuda.matmul.fp32_precision   = 'tf32'  # enable TF32 on Ampere+
+    torch.backends.cudnn.conv.fp32_precision    = 'tf32'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
@@ -71,9 +74,10 @@ def train(args: argparse.Namespace) -> None:
     z_norm = (latents - latent_mean) / latent_std      # (N, latent_len, latent_dim)
     print(f"normalised: mean={z_norm.mean():.4f}  std={z_norm.std():.4f}")
 
-    z_tensor = torch.from_numpy(z_norm)
-    loader   = DataLoader(TensorDataset(z_tensor), batch_size=args.batch_size,
-                          shuffle=True, drop_last=True)
+    # Dataset fits in GPU memory — keep it resident to avoid CPU→GPU transfers per batch.
+    z_gpu     = torch.from_numpy(z_norm).float().to(device)
+    n_samples = z_gpu.shape[0]
+    n_batches = n_samples // args.batch_size
 
     # --- Schedule ---
     schedule = cosine_schedule(args.T)
@@ -86,6 +90,7 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"parameters: {n_params:,}")
+    # model = torch.compile(model)
 
     opt       = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
@@ -96,35 +101,43 @@ def train(args: argparse.Namespace) -> None:
     out_dir = RUNS_ROOT / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    t0 = time.perf_counter()
+    steps_since_log = 0
+
     # --- Training loop ---
     for epoch in range(1, args.epochs + 1):
         model.train()
         loss_sum = 0.0
-        for (z0,) in loader:
-            z0 = z0.to(device)                                   # (B, latent_len, latent_dim)
+        perm = torch.randperm(n_samples, device=device)
+        for bi in range(n_batches):
+            z0 = z_gpu[perm[bi * args.batch_size : (bi + 1) * args.batch_size]]
             B  = z0.shape[0]
 
-            t   = torch.randint(1, args.T + 1, (B,), device=device)   # (B,)
+            t   = torch.randint(1, args.T + 1, (B,), device=device)
             eps = torch.randn_like(z0)
+            ab_t = ab[t].view(B, 1, 1)
+            z_t  = ab_t.sqrt() * z0 + (1 - ab_t).sqrt() * eps
 
-            ab_t  = ab[t].view(B, 1, 1)
-            z_t   = ab_t.sqrt() * z0 + (1 - ab_t).sqrt() * eps
-
-            eps_hat = model(z_t, t)
-            loss    = F.mse_loss(eps_hat, eps)
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                x0_hat = model(z_t, t)
+                loss   = F.mse_loss(x0_hat, z0)
 
             opt.zero_grad()
             loss.backward()
             opt.step()
             ema.update(model)
             loss_sum += loss.item()
+            steps_since_log += 1
 
         scheduler.step()
 
         if epoch % args.log_every == 0:
-            n = len(loader)
+            elapsed     = time.perf_counter() - t0
+            ms_per_step = 1000 * elapsed / steps_since_log
             print(f"epoch {epoch:5d}  lr={scheduler.get_last_lr()[0]:.2e}  "
-                  f"loss={loss_sum/n:.5f}")
+                  f"loss={loss_sum/n_batches:.5f}  {ms_per_step:.1f}ms/step")
+            t0 = time.perf_counter()
+            steps_since_log = 0
 
     # --- Save ---
     # EMA weights are the ones to sample from; keep the raw weights alongside.

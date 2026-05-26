@@ -1,13 +1,17 @@
-"""Canonical 64-D feature layout and pose reconstruction.
+"""Canonical feature layout and pose reconstruction.
 
 Column layout (post-normalisation):
   [0:3]   gvec_pelvis  — gravity direction in pelvis frame (unit vector)
   [3:6]   gyro_pelvis  — angular velocity in pelvis frame × 0.05
   [6:35]  joint_pos    — joint angles minus default_qpos[7:]
   [35:64] joint_vel    — joint velocities × 0.05
+  [64]    root_height  — base z position (m)            [only when D >= 67]
+  [65:67] root_vel_xy  — planar velocity, heading frame [only when D >= 67]
 
-Root XY and height are not encoded in the canonical state; canonical_to_qpos
-fixes root Z at 0.8 m and XY at 0 for rendering purposes.
+For the legacy 64-D layout the root trajectory is not encoded, so
+canonical_to_qpos fixes root Z at 0.8 m and XY at 0. For the 67-D layout the
+height channel sets Z and the heading-frame velocity is integrated (with the
+yaw integrated from gyro_z) to recover a global XY trajectory.
 """
 
 from __future__ import annotations
@@ -17,12 +21,15 @@ from scipy.spatial.transform import Rotation
 
 from motion_latent.obs import GYRO_SCALE
 
-IDX_GVEC      = slice(0, 3)
-IDX_GYRO      = slice(3, 6)
-IDX_JOINT_POS = slice(6, 35)
-IDX_JOINT_VEL = slice(35, 64)
+IDX_GVEC        = slice(0, 3)
+IDX_GYRO        = slice(3, 6)
+IDX_JOINT_POS   = slice(6, 35)
+IDX_JOINT_VEL   = slice(35, 64)
+IDX_ROOT_HEIGHT = 64
+IDX_ROOT_VEL    = slice(65, 67)
 
-ROOT_Z_DEFAULT = 0.8   # fixed render height (m) — true height not in canonical state
+D_WITH_ROOT    = 67    # canonical width that includes root height + planar velocity
+ROOT_Z_DEFAULT = 0.8   # fallback render height (m) when height channel is absent
 
 
 def canonical_to_qpos(
@@ -31,19 +38,22 @@ def canonical_to_qpos(
     freq: float,
     yaw0: float = 0.0,
 ) -> np.ndarray:
-    """Reconstruct (T, 36) MuJoCo qpos from (T, 64) unnormalised canonical state.
+    """Reconstruct (T, 36) MuJoCo qpos from (T, D) unnormalised canonical state.
 
-    Root XY is fixed at 0; root Z at ROOT_Z_DEFAULT. Yaw is integrated from
-    gyro_z (after undoing the ×0.05 scaling).
+    Yaw is integrated from gyro_z (after undoing the ×0.05 scaling). For the
+    67-D layout, root Z comes from the height channel and global XY is integrated
+    from the heading-frame planar velocity; for the legacy 64-D layout, root Z is
+    fixed at ROOT_Z_DEFAULT and XY at 0.
 
     Args:
-        state:       (T, 64) unnormalised canonical feature array
+        state:       (T, D) unnormalised canonical feature array (D = 64 or 67)
         default_qpos: (29,) default joint angles from G1 keyframe
         freq:        motion frequency in Hz
         yaw0:        initial yaw angle in radians
     """
     T  = state.shape[0]
     dt = 1.0 / freq
+    has_root = state.shape[1] >= D_WITH_ROOT
 
     gvec      = state[:, IDX_GVEC]        # (T, 3)  gravity in pelvis frame
     gyro      = state[:, IDX_GYRO]        # (T, 3)  angvel × 0.05
@@ -66,8 +76,22 @@ def canonical_to_qpos(
     quat_mj   = np.concatenate([quat_xyzw[:, 3:4], quat_xyzw[:, :3]], axis=1)
 
     qpos = np.zeros((T, 7 + 29), dtype=np.float64)
-    qpos[:, 0:2] = 0.0
-    qpos[:, 2]   = ROOT_Z_DEFAULT
+    if has_root:
+        # Height directly from the height channel.
+        qpos[:, 2] = state[:, IDX_ROOT_HEIGHT]
+        # Integrate global XY from heading-frame velocity (rotate by +yaw → world).
+        vel_h = state[:, IDX_ROOT_VEL]                      # (T, 2)
+        cos, sin = np.cos(yaw), np.sin(yaw)
+        vel_world_x = cos * vel_h[:, 0] - sin * vel_h[:, 1]
+        vel_world_y = sin * vel_h[:, 0] + cos * vel_h[:, 1]
+        xy = np.zeros((T, 2))
+        for t in range(1, T):
+            xy[t, 0] = xy[t - 1, 0] + vel_world_x[t - 1] * dt
+            xy[t, 1] = xy[t - 1, 1] + vel_world_y[t - 1] * dt
+        qpos[:, 0:2] = xy
+    else:
+        qpos[:, 0:2] = 0.0
+        qpos[:, 2]   = ROOT_Z_DEFAULT
     qpos[:, 3:7] = quat_mj
     qpos[:, 7:]  = joint_pos + default_qpos
     return qpos

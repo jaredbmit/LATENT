@@ -1,5 +1,11 @@
 """Diffusion denoiser models for motion chunks.
 
+Both backbones predict the clean sample x0 (not the noise eps). For smooth,
+low-dimensional motion this lets the model exploit its temporal/smoothness
+prior instead of regressing unstructured noise, and avoids the high-noise
+x0-reconstruction blow-up of eps-prediction.
+
+
 Two backbones share the same forward signature and conditioning interface:
 
   MotionDiT  — Diffusion Transformer (Peebles & Xie 2023, AdaLN-zero).
@@ -147,7 +153,7 @@ class MotionDiT(nn.Module):
 
     def forward(self, z_t: torch.Tensor, t: torch.Tensor,
                 cond: torch.Tensor | None = None) -> torch.Tensor:
-        """z_t: (B, L, latent_dim)  t: (B,) int  cond: (B, cond_dim) or None → eps."""
+        """z_t: (B, L, latent_dim)  t: (B,) int  cond: (B, cond_dim) or None → x0_hat."""
         if self.cond_mode == "input_concat":
             cond_exp = cond.unsqueeze(1).expand(-1, z_t.shape[1], -1)  # (B, L, cond_dim)
             x = self.in_proj(torch.cat([z_t, cond_exp], dim=-1)) + self.pos_emb
@@ -232,7 +238,7 @@ class MotionMLP(nn.Module):
 
     def forward(self, z_t: torch.Tensor, t: torch.Tensor,
                 cond: torch.Tensor | None = None) -> torch.Tensor:
-        """z_t: (B, L, D)  t: (B,) int  cond: (B, cond_dim) or None → eps same shape."""
+        """z_t: (B, L, D)  t: (B,) int  cond: (B, cond_dim) or None → x0_hat same shape."""
         B = z_t.shape[0]
         x  = z_t.reshape(B, -1)        # (B, L*D)
         te = self.time_emb(t)           # (B, t_dim)

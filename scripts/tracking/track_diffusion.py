@@ -46,7 +46,6 @@ from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.sampler import ddim_sample
 from motion_latent.diffusion.schedule import cosine_schedule
 from motion_latent.features import canonical_to_qpos
-from motion_latent.obs import GYRO_SCALE
 from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH, FEAT_DIR
 
 
@@ -161,7 +160,7 @@ def _build_ref(canonical: np.ndarray, default_qpos: np.ndarray,
     qpos = canonical_to_qpos(canonical, default_qpos, freq=freq)
     qpos[:, 2] -= _ground_height_correction(mj_model, qpos[0])
 
-    gyro = canonical[:, 3:6] / GYRO_SCALE
+    gyro = canonical[:, 3:6]
     jpos = canonical[:, 6:35]                               # (H, 29) joint angles (unnormalised)
     jvel_fd = np.diff(jpos, axis=0) * freq                  # (H-1, 29) finite-diff velocity
     jvel = np.vstack([jvel_fd, jvel_fd[-1:]])               # (H, 29) repeat last frame

@@ -14,11 +14,11 @@ Within the 151-D full tracker obs the layout is:
   joint_vel      [93:122]  ← canonical end
   motor_targets  [122:151]
 
-Scalings applied by the env (must be matched during feature extraction):
-  gvec_pelvis   : unscaled (unit gravity vector in pelvis frame)
-  gyro_pelvis   : ×0.05
-  joint_pos     : minus default_qpos[7:], unscaled
-  joint_vel     : ×0.05
+All quantities are stored unscaled:
+  gvec_pelvis   : unit gravity vector in pelvis frame
+  gyro_pelvis   : angular velocity in pelvis frame (rad/s)
+  joint_pos     : joint angles minus default_qpos[7:] (rad)
+  joint_vel     : joint velocities (rad/s)
 """
 
 from __future__ import annotations
@@ -28,8 +28,6 @@ import numpy as np
 D_CANONICAL     = 64
 CANONICAL_KEYS  = ["gvec_pelvis", "gyro_pelvis", "joint_pos", "joint_vel"]
 CANONICAL_SLICE = slice(58, 122)
-GYRO_SCALE      = 0.05
-JOINT_VEL_SCALE = 0.05
 
 
 def extract_canonical(obs_full: np.ndarray) -> np.ndarray:

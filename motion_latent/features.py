@@ -1,8 +1,8 @@
 """Canonical feature layout and pose reconstruction.
 
-Column layout (post-normalisation):
+Column layout (D=38):
   [0:3]   gvec_pelvis  — gravity direction in pelvis frame (unit vector)
-  [3:6]   gyro_pelvis  — angular velocity in pelvis frame × 0.05
+  [3:6]   gyro_pelvis  — angular velocity in pelvis frame (rad/s)
   [6:35]  joint_pos    — joint angles minus default_qpos[7:]
   [35]    root_height  — base z position (m)            [only when D >= 38]
   [36:38] root_vel_xy  — planar velocity, heading frame [only when D >= 38]
@@ -21,7 +21,6 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from motion_latent.obs import GYRO_SCALE
 
 IDX_GVEC        = slice(0, 3)
 IDX_GYRO        = slice(3, 6)
@@ -41,9 +40,9 @@ def canonical_to_qpos(
 ) -> np.ndarray:
     """Reconstruct (T, 36) MuJoCo qpos from (T, D) unnormalised canonical state.
 
-    Yaw is integrated from gyro_z (after undoing the ×0.05 scaling). For the
-    38-D layout, root Z comes from the height channel and global XY is integrated
-    from the heading-frame planar velocity; for a joints-only layout, root Z is
+    Yaw is integrated from gyro_z. For the 38-D layout, root Z comes 
+    from the height channel and global XY is integrated from the 
+    heading-frame planar velocity; for a joints-only layout, root Z is
     fixed at ROOT_Z_DEFAULT and XY at 0.
 
     Args:
@@ -57,15 +56,14 @@ def canonical_to_qpos(
     has_root = state.shape[1] >= D_WITH_ROOT
 
     gvec      = state[:, IDX_GVEC]        # (T, 3)  gravity in pelvis frame
-    gyro      = state[:, IDX_GYRO]        # (T, 3)  angvel × 0.05
+    gyro      = state[:, IDX_GYRO]        # (T, 3)  angvel (rad/s)
     joint_pos = state[:, IDX_JOINT_POS]   # (T, 29) angles - default
 
-    # Yaw: integrate gyro_z (undo scale → rad/s)
-    gyro_z_raw = gyro[:, 2] / GYRO_SCALE
+    # Yaw: integrate gyro_z
     yaw = np.empty(T)
     yaw[0] = yaw0
     for t in range(1, T):
-        yaw[t] = yaw[t - 1] + gyro_z_raw[t - 1] * dt
+        yaw[t] = yaw[t - 1] + gyro[t - 1, 2] * dt
 
     # Pitch/roll from gravity vector: gvec = R_root^T @ [0, 0, -1]
     gx, gy, gz = gvec[:, 0], gvec[:, 1], gvec[:, 2]

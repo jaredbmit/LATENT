@@ -4,7 +4,7 @@ Per-frame feature vector (D=38). Joint velocities are intentionally omitted:
 they are finite differences of joint_pos and can be recovered downstream by
 differencing the joint-angle sequence.
   [0:3]   gvec_pelvis  — gravity direction in pelvis frame (unit vector)
-  [3:6]   gyro_pelvis  — angular velocity in pelvis frame × 0.05
+  [3:6]   gyro_pelvis  — angular velocity in pelvis frame (rad/s)
   [6:35]  joint_pos    — joint angles minus default_qpos[7:]
   [35:36] root_height  — base z position (m); yaw-invariant
   [36:38] root_vel_xy  — planar linear velocity in the heading (yaw-only) frame
@@ -30,7 +30,6 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from motion_latent.obs import GYRO_SCALE
 from motion_latent.paths import G1_XML
 
 # ---------------------------------------------------------------------------
@@ -101,9 +100,9 @@ def extract_features(path: Path, default_qpos: np.ndarray, freq: float = 50.0) -
     grav_global = np.broadcast_to([0.0, 0.0, -1.0], (T, 3)).copy()
     gvec        = R_root.inv().apply(grav_global).astype(np.float32)   # (T, 3)
 
-    # gyro_pelvis: body-frame angular velocity × scale (matches tracker obs_scales)
+    # gyro_pelvis: body-frame angular velocity (rad/s)
     angvel_root = _angular_velocity_local(R_root, freq)               # (T, 3)
-    gyro        = (angvel_root * GYRO_SCALE).astype(np.float32)       # (T, 3)
+    gyro        = angvel_root.astype(np.float32)                      # (T, 3)
 
     # joint_pos: angles relative to default pose (matches tracker joint_pos obs)
     joint_pos = (joint_ang - default_qpos).astype(np.float32)         # (T, 29)
@@ -186,7 +185,6 @@ def main() -> None:
         "feature_names": FEATURE_NAMES,
         "D": D,
         "freq": args.freq,
-        "gyro_scale": GYRO_SCALE,
         "total_frames": total_frames,
         "sources": [str(p) for p in raw_files],
     }

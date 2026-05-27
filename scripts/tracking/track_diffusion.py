@@ -46,8 +46,8 @@ from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.sampler import ddim_sample
 from motion_latent.diffusion.schedule import cosine_schedule
 from motion_latent.features import canonical_to_qpos
-from motion_latent.obs import GYRO_SCALE, JOINT_VEL_SCALE
-from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
+from motion_latent.obs import GYRO_SCALE
+from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH, FEAT_DIR
 
 
 _RAW_TYPES = {"motion_dit_raw", "motion_mlp_raw"}
@@ -86,17 +86,16 @@ def _load_onnx(exp_name: str) -> rt.InferenceSession:
     return rt.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 
 
-def _generate_chunk(diff_run: str, vae_run_override: str,
+def _generate_chunk(dit, cfg: dict, vae_run_override: str,
                     ddim_steps: int, device: torch.device,
                     cond_canonical: np.ndarray | None = None) -> np.ndarray:
-    """Return (H, 64) unnormalised canonical features for one chunk.
+    """Return (H, 38) unnormalised canonical features for one chunk.
 
-    cond_canonical: (N, 64) unnormalised canonical conditioning frames, or None
+    cond_canonical: (N, 38) unnormalised canonical conditioning frames, or None
                     for unconditional sampling.  Ignored for non-raw models.
     """
     from motion_latent.diffusion.sampler import ddim_inpaint_sample, ddim_prepend_sample
 
-    dit, cfg = load_model(RUNS_ROOT / diff_run, device)
     model_type = cfg.get("model_type", "motion_dit")
     n_cond     = cfg.get("n_cond", 0)
     cond_mode  = cfg.get("cond_mode", "none")
@@ -158,12 +157,14 @@ def _ground_height_correction(mj_model: mujoco.MjModel, qpos0: np.ndarray) -> fl
 
 def _build_ref(canonical: np.ndarray, default_qpos: np.ndarray,
                freq: float, mj_model: mujoco.MjModel) -> tuple[np.ndarray, np.ndarray]:
-    """canonical (H, 64) → qpos (H, 36), qvel (H, 35), root Z grounded."""
+    """canonical (H, 38) → qpos (H, 36), qvel (H, 35), root Z grounded."""
     qpos = canonical_to_qpos(canonical, default_qpos, freq=freq)
     qpos[:, 2] -= _ground_height_correction(mj_model, qpos[0])
 
     gyro = canonical[:, 3:6] / GYRO_SCALE
-    jvel = canonical[:, 35:64] / JOINT_VEL_SCALE
+    jpos = canonical[:, 6:35]                               # (H, 29) joint angles (unnormalised)
+    jvel_fd = np.diff(jpos, axis=0) * freq                  # (H-1, 29) finite-diff velocity
+    jvel = np.vstack([jvel_fd, jvel_fd[-1:]])               # (H, 29) repeat last frame
 
     qvel = np.zeros((qpos.shape[0], 6 + 29), dtype=np.float64)
     qvel[:, 3:6] = gyro
@@ -215,12 +216,26 @@ def run_seed(seed: int, args: Args, policy: rt.InferenceSession,
              mj_model: mujoco.MjModel, obs_cfg, obs_joint_ids: np.ndarray,
              active_actuator_ids: np.ndarray, valid_body_ids: np.ndarray,
              default_qpos: np.ndarray, freq: float,
-             device: torch.device) -> SeedMetrics:
+             device: torch.device,
+             dit, cfg: dict) -> SeedMetrics:
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    canonical = _generate_chunk(args.diff_run, args.vae_run, args.ddim_steps, device)
+    # Seed conditional models with real data rather than zeros.
+    cond_canonical = None
+    n_cond = cfg.get("n_cond", 0)
+    if n_cond > 0 and cfg.get("cond_mode", "none") != "none":
+        from motion_latent.chunk_vae.dataset import MotionChunkDataset
+        H_cfg = cfg.get("H", 50)
+        dataset = MotionChunkDataset(FEAT_DIR, STATS_PATH, H=H_cfg, n_cond=max(n_cond, 1))
+        stats = np.load(STATS_PATH)
+        idx = np.random.randint(len(dataset))
+        cond_norm = dataset[idx][1][-n_cond:].numpy()          # (n_cond, D) VAE-normalised
+        cond_canonical = cond_norm * stats["std"] + stats["mean"]  # unnormalised canonical
+
+    canonical = _generate_chunk(dit, cfg, args.vae_run, args.ddim_steps, device,
+                                cond_canonical)
     ref_qpos, ref_qvel = _build_ref(canonical, default_qpos, freq, mj_model)
     T = ref_qpos.shape[0]
 
@@ -375,6 +390,7 @@ def main(args: Args) -> None:
     valid_body_ids = _valid_body_ids(mj_model)
     default_qpos   = np.array(consts.DEFAULT_QPOS)[7:]
 
+    dit, cfg = load_model(RUNS_ROOT / args.diff_run, device)
     print(f"\ndiff_run: {args.diff_run}  |  seeds {args.seed}–{args.seed + args.n_seeds - 1}"
           f"  |  {'no video' if args.no_video else 'saving videos'}")
 
@@ -382,7 +398,8 @@ def main(args: Args) -> None:
     for s in range(args.seed, args.seed + args.n_seeds):
         print(f"\n[seed {s}]")
         m = run_seed(s, args, policy, mj_model, obs_cfg, obs_joint_ids,
-                     active_actuator_ids, valid_body_ids, default_qpos, freq, device)
+                     active_actuator_ids, valid_body_ids, default_qpos, freq, device,
+                     dit, cfg)
         print(f"  jpos_rmse={m.joint_pos_rmse:.2f}°  jvel_rmse={m.joint_vel_rmse:.3f} r/s  "
               f"mpjpe={m.mpjpe:.1f} mm  root_h={m.root_height_err:.4f} m")
         all_metrics.append(m)

@@ -33,7 +33,8 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH
+from motion_latent.paths import G1_XML, RUNS_ROOT, META_PATH, STATS_PATH, FEAT_DIR
+from motion_latent.chunk_vae.dataset import MotionChunkDataset
 from motion_latent.diffusion.model import load_model
 from motion_latent.diffusion.rollout import generate_trajectory
 from motion_latent.render import play_overlay, record_video
@@ -59,6 +60,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
 
     m            = mujoco.MjModel.from_xml_path(str(args.xml))
     kid          = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -76,12 +78,21 @@ def main() -> None:
     stats = np.load(STATS_PATH)
     mean, std = stats["mean"], stats["std"]
 
+    init_cond = None
+    if cond_mode != "none" and n_cond > 0:
+        H_cfg = cfg.get("H", 50)
+        dataset = MotionChunkDataset(FEAT_DIR, STATS_PATH, H=H_cfg, n_cond=max(n_cond, 1))
+        idx = rng.integers(len(dataset))
+        cond_frames = dataset[int(idx)][1][-n_cond:].unsqueeze(0).to(device)  # (1, n_cond, D)
+        init_cond = cond_frames
+
     with torch.no_grad():
         feats_norm = generate_trajectory(
             dit, cfg,
             n_chunks=args.n_chunks,
             device=device,
             ddim_steps=args.ddim_steps,
+            init_cond=init_cond,
         )   # (T_total, D) normalised
 
     total_frames = feats_norm.shape[0]

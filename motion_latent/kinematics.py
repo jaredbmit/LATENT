@@ -2,7 +2,7 @@
 
 Thin wrapper over `pytorch_kinematics`: the kinematic chain is parsed once from
 the G1 MJCF and FK is evaluated in batched, autograd-friendly PyTorch. This lets
-the diffusion trainer impose geometric losses (hand/foot positions, foot sliding)
+the diffusion trainer impose geometric losses (hand/foot positions)
 directly on predicted motion features.
 
 Frame convention: positions are returned in the **pelvis-local frame** — the
@@ -26,10 +26,7 @@ import torch.nn as nn
 import pytorch_kinematics as pk
 
 from motion_latent.paths import G1_XML
-from motion_latent.obs import GYRO_SCALE
-from motion_latent.features import (
-    IDX_GVEC, IDX_GYRO, IDX_JOINT_POS, IDX_ROOT_HEIGHT, IDX_ROOT_VEL,
-)
+from motion_latent.features import IDX_JOINT_POS
 
 # Feet are the ankle-roll body origins (foot sites sit at offset 0); hands are
 # the palm sites, offset along +x in the wrist-yaw link frame.
@@ -131,79 +128,3 @@ class G1Kinematics(nn.Module):
         feet = _sites(FOOT_LINKS, self._foot_off).reshape(*lead, len(FOOT_LINKS), 3)
         hands = _sites(HAND_LINKS, self._hand_off).reshape(*lead, len(HAND_LINKS), 3)
         return {"feet": feet, "hands": hands}
-
-    def foot_world(self, feat: torch.Tensor, freq: float) -> dict[str, torch.Tensor]:
-        """World-frame foot height and (drift-free) world foot velocity from a chunk.
-
-        feat: (B, H, D) **unnormalised** canonical features (D >= 38, see features.py).
-        Returns:
-            height: (B, H, 2) world z of each foot (left, right).
-            vel:    (B, H-1, 2, 3) world foot velocity per inter-frame step.
-
-        The velocity is exact and integration-free: a finite-difference step needs
-        only the *relative* root motion between consecutive frames, all local in the
-        feature vector — the body-frame angular velocity (gyro) gives the exact
-        inter-frame relative rotation, the heading-frame planar root velocity and
-        root-height delta give the root translation, and pitch/roll from gvec map the
-        translation into the body frame. The step displacement is evaluated in the
-        earlier frame's root *body* frame; since only its magnitude is used (and that
-        is frame-invariant) global yaw never has to be integrated, so a foot planted
-        in the world reads zero velocity even while the body translates over it.
-        """
-        gvec = feat[..., IDX_GVEC]                       # (B,H,3) gravity in pelvis frame
-        gyro = feat[..., IDX_GYRO]                        # (B,H,3) angvel × GYRO_SCALE
-        root_h = feat[..., IDX_ROOT_HEIGHT]               # (B,H)
-        root_vxy = feat[..., IDX_ROOT_VEL]                # (B,H,2) heading-frame m/s
-        foot_loc = self(feat[..., IDX_JOINT_POS])["feet"] # (B,H,2,3) pelvis-local
-
-        # World height: third row of R_root is -gvec, so (R_root p)_z = -gvec·p.
-        height = root_h.unsqueeze(-1) - (gvec.unsqueeze(-2) * foot_loc).sum(dim=-1)  # (B,H,2)
-
-        dt = 1.0 / freq
-        # Per-frame root orientation with yaw zeroed (pitch/roll from gvec); only its
-        # transpose is needed, to map the (yaw-removed) world root displacement into
-        # the root body frame.
-        gx, gy, gz = gvec[..., 0], gvec[..., 1], gvec[..., 2]
-        roll = torch.atan2(-gy, -gz)
-        pitch = torch.atan2(gx, torch.sqrt(gy * gy + gz * gz))
-        R_noyaw_T = (_roty(pitch) @ _rotx(roll)).transpose(-1, -2)        # (B,H,3,3)
-
-        # Exact inter-frame relative rotation R(t)^T R(t+1) from body angular velocity.
-        dR = _rotvec_to_mat((gyro[:, :-1] / GYRO_SCALE) * dt)             # (B,H-1,3,3)
-
-        # Root translation between frames, expressed in the yaw-removed world frame
-        # (heading-frame planar velocity is already yaw-aligned; height is world z),
-        # then rotated into the root(t) body frame.
-        disp = torch.stack([
-            root_vxy[:, :-1, 0] * dt,
-            root_vxy[:, :-1, 1] * dt,
-            root_h[:, 1:] - root_h[:, :-1],
-        ], dim=-1)                                         # (B,H-1,3)
-        disp_body = (R_noyaw_T[:, :-1] @ disp.unsqueeze(-1)).squeeze(-1)  # (B,H-1,3)
-
-        # Foot displacement in the root(t) body frame: dR·p(t+1) - p(t) + root disp.
-        foot_tp1 = (dR.unsqueeze(2) @ foot_loc[:, 1:].unsqueeze(-1)).squeeze(-1)  # (B,H-1,2,3)
-        vel = (disp_body.unsqueeze(2) + foot_tp1 - foot_loc[:, :-1]) / dt          # (B,H-1,2,3)
-        return {"height": height, "vel": vel}
-
-
-def _rotx(a: torch.Tensor) -> torch.Tensor:
-    c, s, o, z = a.cos(), a.sin(), torch.ones_like(a), torch.zeros_like(a)
-    return torch.stack([o, z, z, z, c, -s, z, s, c], dim=-1).reshape(*a.shape, 3, 3)
-
-
-def _roty(a: torch.Tensor) -> torch.Tensor:
-    c, s, o, z = a.cos(), a.sin(), torch.ones_like(a), torch.zeros_like(a)
-    return torch.stack([c, z, s, z, o, z, -s, z, c], dim=-1).reshape(*a.shape, 3, 3)
-
-
-def _rotvec_to_mat(v: torch.Tensor) -> torch.Tensor:
-    """Batched axis-angle (rotation vector) → rotation matrix. v: (..., 3) → (..., 3, 3)."""
-    theta = v.norm(dim=-1, keepdim=True).clamp_min(1e-8)   # (...,1)
-    axis = v / theta
-    x, y, z = axis[..., 0], axis[..., 1], axis[..., 2]
-    zr = torch.zeros_like(x)
-    K = torch.stack([zr, -z, y, z, zr, -x, -y, x, zr], dim=-1).reshape(*v.shape[:-1], 3, 3)
-    th = theta.unsqueeze(-1)                                 # (...,1,1)
-    eye = torch.eye(3, device=v.device, dtype=v.dtype).expand_as(K)
-    return eye + th.sin() * K + (1.0 - th.cos()) * (K @ K)

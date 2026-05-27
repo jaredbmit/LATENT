@@ -148,6 +148,7 @@ def generate_trajectory(
     device: torch.device,
     ddim_steps: int = 50,
     schedule: Schedule | None = None,
+    init_cond: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Generate a long motion trajectory by stitching n_chunks diffusion samples.
 
@@ -178,7 +179,8 @@ def generate_trajectory(
 
     # ------------------------------------------------------------------ generate
     chunks: list[torch.Tensor] = []
-    chunks.append(sample_chunks(model, cfg, schedule, 1, device, ddim_steps))
+    chunks.append(sample_chunks(model, cfg, schedule, 1, device, ddim_steps,
+                                cond_z_norm=init_cond))
 
     if cond_mode == "none":
         # Independent samples — just concatenate, no cross-chunk conditioning.

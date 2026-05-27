@@ -295,7 +295,7 @@ def main() -> None:
     # --- auxiliary losses ---
     ap.add_argument("--lambda_ee_pos",  type=float, default=1.0,
                     help="Weight on MSE between predicted/target hand+foot FK positions (pelvis-local).")
-    ap.add_argument("--lambda_joint_vel", type=float, default=0.1,
+    ap.add_argument("--lambda_joint_vel", type=float, default=1.0,
                     help="Weight on MSE of finite-diff joint-angle velocity (29 DOF, normalised space).")
     args = ap.parse_args()
 

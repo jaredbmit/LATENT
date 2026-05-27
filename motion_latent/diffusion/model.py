@@ -146,8 +146,6 @@ class MotionDiT(nn.Module):
         )
         self.out_norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_model, latent_dim)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
         nn.init.normal_(self.pos_emb, std=0.02)
 
@@ -233,8 +231,6 @@ class MotionMLP(nn.Module):
         self.in_proj  = nn.Linear(in_dim, d_hidden)
         self.blocks   = nn.ModuleList([_MLPBlock(d_hidden) for _ in range(n_layers)])
         self.out_proj = nn.Linear(d_hidden, flat_dim)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, z_t: torch.Tensor, t: torch.Tensor,
                 cond: torch.Tensor | None = None) -> torch.Tensor:
